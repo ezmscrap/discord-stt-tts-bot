@@ -1188,7 +1188,7 @@ def _format_cmd_line(item: dict, prefix: str) -> tuple[str, str]:
     value = f"**書式**: `{usage}`\n{desc}"
     return name, value
 
-@bot.command(name="help")
+@bot.command(name="llkhelp")
 async def help_command(ctx: commands.Context, *, command_name: str = None):
     """カスタムヘルプ: !help / !help <コマンド名>"""
     prefix = ctx.prefix or "!"
