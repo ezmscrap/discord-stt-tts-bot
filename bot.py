@@ -1,4 +1,4 @@
-import io, os, wave, asyncio, tempfile, traceback, struct, math
+import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time
 import discord
 import typing as T
 
@@ -36,6 +36,46 @@ openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 guild_state = {}  # guild_id -> dict( read_channel_id, stt_on, record_window )
 
 DEFAULT_WINDOW = 10  # 秒ごとに録音を区切って字幕化
+
+def _dbfs_from_rms(rms: float) -> float:
+    if rms <= 1e-9:
+        return -120.0
+    return 20.0 * math.log10(rms)
+
+def jp_cleanup(text: str) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return t
+    # 末尾に句読点が無ければ「。」を付ける（英数で終わるなら付けない）
+    if not re.search(r"[。！？!?]$", t) and re.search(r"[ぁ-んァ-ン一-龥]", t):
+        t += "。"
+    return t
+
+async def post_caption(guild_id: int, channel, user_id: int, username: str, new_text: str):
+    st = get_state(guild_id)
+    now = time.monotonic()
+    ch_id = str(getattr(channel, "id", 0))
+    key_u = str(user_id)
+
+    ch_map = st["last_msgs"].setdefault(ch_id, {})
+    entry = ch_map.get(key_u)
+
+    # 直近メッセージがあって merge_window 内なら編集で追記
+    if entry and entry.get("message") and (now - entry.get("ts", 0)) < st["merge_window"]:
+        try:
+            base = entry["message"].content
+            # 先頭の「🎤 **名前**: 」を保ったまま後ろに文章を足す
+            # baseが空でない前提で半角スペース区切り
+            merged = (base + " " + new_text).strip()
+            await entry["message"].edit(content=merged)
+            entry["ts"] = now
+            return
+        except Exception as e:
+            print("[STT] edit failed; fallback send:", repr(e))
+
+    # 新規投稿
+    m = await channel.send(f"🎤 **{username}**: {new_text}")
+    ch_map[key_u] = {"message": m, "ts": now}
 
 async def resolve_display_name(guild: discord.Guild, user_id: int, data=None) -> str:
     # 1) Sink が user を持っていれば最優先
@@ -277,51 +317,39 @@ async def rectest(ctx: commands.Context, seconds: int = 5):
 
     async def finished_callback(sink, *args):
         try:
-            files_info = []
-            attachments = []
-
+            # だれのトラックが生成されたかを一覧表示
+            print("[STT] users in window:", list(sink.audio_data.keys()))
             for user_id, data in sink.audio_data.items():
-                fileobj = data.file  # これがパス or BytesIO
-                name = await resolve_display_name(g, int(user_id), data)
-                fname = f"{name.replace(' ', '_')}.wav"
+                uid = int(user_id)
 
-                # 分岐：パス or メモリ
-                if isinstance(fileobj, (str, os.PathLike)):
-                    dur, rms = wav_stats(fileobj)
-                    size = os.path.getsize(fileobj)
-                    attachments.append(discord.File(fileobj, filename=fname))
+                # どのくらい録れたか（py-cordのAudioDataはbyte_countを持っているはず）
+                byte_count = getattr(data, "byte_count", None)
+
+                # fileサイズ（WAVならヘッダ込みサイズ）
+                size = None
+                f = data.file
+                if isinstance(f, (str, os.PathLike)):
+                    try: size = os.path.getsize(f)
+                    except: size = None
                 else:
-                    # BytesIO など file-like
                     try:
-                        fileobj.seek(0)
+                        pos = f.tell()
+                        f.seek(0, os.SEEK_END)
+                        size = f.tell()
+                        f.seek(0)
                     except Exception:
-                        pass
-                    buf = fileobj.read() if hasattr(fileobj, "read") else bytes(fileobj)
-                    size = len(buf)
-                    dur, rms = wav_stats(buf)
-                    bio = io.BytesIO(buf); bio.seek(0)
-                    attachments.append(discord.File(bio, filename=fname))
+                        size = None
 
-                files_info.append((name, dur, rms, size))
+                print(f"[STT] capture stat uid={uid} byte_count={byte_count} size={size}")
 
-            if not files_info:
-                await ctx.reply("⚠️ 録音できませんでした。誰も話していない/ボットが聴覚遮断の可能性があります。")
-            else:
-                lines = ["🎧 **録音テスト結果**"]
-                for name, dur, rms, size in files_info:
-                    lines.append(f"- {name}: {dur:.2f}s, RMS={rms}, {size/1024:.1f}KB")
-                await ctx.reply("\n".join(lines))
-                # 添付送信（サイズが大きいと失敗する場合あり）
-                for f in attachments:
-                    try:
-                        await ctx.send(file=f)
-                    except Exception as e:
-                        await ctx.send(f"（添付失敗: {getattr(f, 'filename', 'file')} / {e!r}）")
+                # 典型的な「空WAV」（ヘッダだけ ≒ 44バイト）や byte_count==0 は弾く
+                if (byte_count is not None and byte_count == 0) or (size is not None and size <= 44):
+                    continue
+
+                # 実データだけ追加
+                buf = _collect_filelike(data.file)
+                captured.append((uid, data, buf))
         finally:
-            try:
-                vc.stop_recording()
-            except:
-                pass
             done.set()
 
     try:
@@ -342,8 +370,42 @@ async def rectest(ctx: commands.Context, seconds: int = 5):
 
 def get_state(guild_id):
     if guild_id not in guild_state:
-        guild_state[guild_id] = dict(read_channel_id=None, stt_on=False, record_window=DEFAULT_WINDOW, stt_task=None)
+        guild_state[guild_id] = dict(
+            read_channel_id=None,
+            stt_on=False,
+            record_window=DEFAULT_WINDOW,
+            stt_task=None,
+            # VADデフォルトを見直し
+            vad_rms=0.008,     # 以前0.02 → 下げる
+            vad_db=-46.0,      # 追加（dBFS）
+            min_dur=0.4,       # 以前0.8 → 0.4s
+            # 追記マージ
+            merge_window=15.0, # 初期値少し長め
+            merge_auto=True,   # ★ 追加: record_windowに追従
+            # 言語・投稿先
+            lang="ja",
+            use_thread=False,
+            caption_dest_id=None,
+            # ★ 変更: { str(channel_id): { str(user_id): {"message": Message, "ts": float} } }
+            last_msgs={},
+            rec_lock=asyncio.Lock(),
+        )
     return guild_state[guild_id]
+
+async def ensure_stopped(vc: discord.VoiceClient, why: str = ""):
+    """録音が残っていれば強制停止して、少し待つ"""
+    try:
+        rec_flag = getattr(vc, "recording", False)
+        print(f"[STT] ensure_stopped({why}) recording={rec_flag}")
+        if rec_flag:
+            try:
+                vc.stop_recording()
+                print("[STT] forced stop_recording()")
+            except Exception as e:
+                print("[STT] forced stop failed:", repr(e))
+        await asyncio.sleep(0.25)  # フラッシュ待ち
+    except Exception as e:
+        print("[STT] ensure_stopped error:", repr(e))
 
 def sanitize_for_tts(text: str) -> str:
     import re
@@ -497,6 +559,9 @@ async def stton(ctx: commands.Context, window: int | None = None):
     st = get_state(ctx.guild.id)
     if window and 3 <= window <= 60:
         st["record_window"] = window
+        if st.get("merge_auto", True):
+            # 認識窓より少し長く（1.25倍 + 余裕）
+            st["merge_window"] = max(st["merge_window"], round(window * 1.25, 2))
 
     # 既存タスク停止
     if st.get("stt_task") and not st["stt_task"].done():
@@ -525,7 +590,12 @@ async def sttoff(ctx: commands.Context):
         try: await st["stt_task"]
         except: pass
     st["stt_task"] = None
+    # ★ 念のため停止
+    vc = ctx.guild.voice_client
+    if vc and vc.is_connected():
+        await ensure_stopped(vc, "manual off")
     await ctx.reply("音声認識を停止しました。")
+
 
 @bot.command(name="readhere", aliases=["ここを読み上げ"])
 async def readhere(ctx: commands.Context):
@@ -552,76 +622,163 @@ async def on_message(message: discord.Message):
         to_say = f"{display}：{text}"
         await tts_play(message.guild, to_say)
     
+@bot.command(name="sttset")
+async def sttset(ctx, key: str=None, value: str=None):
+    """
+      !sttset vad 0.008
+      !sttset vaddb -46
+      !sttset mindur 0.4
+      !sttset merge 14
+      !sttset mergeauto on/off
+      !sttset lang auto
+      !sttset thread on
+    """
+    st = get_state(ctx.guild.id)
+    if not key:
+        return await ctx.reply(
+            ("設定: vad={vad_rms} vaddb={vad_db} mindur={min_dur}s "
+             "merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread}").format(**st)
+        )
+
+    try:
+        k = key.lower()
+        if k == "vad":
+            st["vad_rms"] = float(value)
+        elif k in ("vaddb","db"):
+            st["vad_db"] = float(value)
+        elif k in ("mindur","min"):
+            st["min_dur"] = float(value)
+        elif k in ("merge","mw"):
+            st["merge_window"] = float(value)
+        elif k in ("mergeauto","ma"):
+            st["merge_auto"] = (value.lower() in ("on","true","1","yes","y"))
+        elif k == "lang":
+            st["lang"] = value.lower()
+        elif k in ("thread","th"):
+            st["use_thread"] = (value.lower() in ("on","true","1","yes","y"))
+            st["caption_dest_id"] = None
+        else:
+            return await ctx.reply("未知のキー: vad / vaddb / mindur / merge / mergeauto / lang / thread")
+    except Exception as e:
+        return await ctx.reply(f"設定失敗: {e!r}")
+
+    await ctx.reply(
+        ("OK: vad={vad_rms} vaddb={vad_db} mindur={min_dur}s "
+         "merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread}").format(**st)
+    )
 
 
 async def stt_worker(guild_id: int, channel_id: int):
-    g = bot.get_guild(guild_id)
-    if not g:
+    guild_obj = bot.get_guild(guild_id)
+    if not guild_obj:
         return
     print("[STT] worker start", guild_id, channel_id)
+    st = get_state(guild_id)
+
     try:
         while True:
-            vc = g.voice_client
+            vc = guild_obj.voice_client
             if not vc or not vc.is_connected():
                 print("[STT] no voice connection; retry")
                 await asyncio.sleep(1.0)
                 continue
 
-            ch = await resolve_message_channel(channel_id, guild_id)
-            if ch is None:
+            # 投稿先解決
+            base = await resolve_message_channel(channel_id, guild_id)
+            if base is None:
                 print("[STT] message channel not found; retry")
                 await asyncio.sleep(2.0)
                 continue
 
-            # どのタイプのVCにいるかを可視化
-            try:
-                ch_type = type(vc.channel).__name__
-                print(f"[STT] in voice channel type = {ch_type}")
-            except Exception:
-                pass
-
-            sink = discord.sinks.WaveSink()
-            done = asyncio.Event()
-            captured = []
-
-            def _collect_filelike(fileobj) -> bytes:
-                if isinstance(fileobj, (str, os.PathLike)):
-                    with open(fileobj, "rb") as rf:
-                        return rf.read()
+            # スレッド（必要なら）
+            dest = base
+            if st["use_thread"]:
                 try:
-                    fileobj.seek(0)
-                except Exception:
-                    pass
-                return fileobj.read() if hasattr(fileobj, "read") else bytes(fileobj)
+                    if st.get("caption_dest_id"):
+                        t = await resolve_message_channel(st["caption_dest_id"], guild_id)
+                        if isinstance(t, discord.Thread):
+                            dest = t
+                        else:
+                            st["caption_dest_id"] = None
+                    if st.get("caption_dest_id") is None and isinstance(base, discord.TextChannel):
+                        th = await base.create_thread(name="🎤字幕", auto_archive_duration=60)
+                        st["caption_dest_id"] = th.id
+                        dest = th
+                except Exception as e:
+                    print("[STT] thread create/resolve failed:", repr(e))
+                    dest = base
 
-            async def finished_callback(sink, *args):
+            # ===== 録音 1 サイクル =====
+            async with st["rec_lock"]:  # ★ 同時実行をブロック
+                # もし取り残しがあれば止める
+                await ensure_stopped(vc, "before start")
+
+                sink = discord.sinks.WaveSink()
+                done = asyncio.Event()
+                captured: list[tuple[int, object, bytes]] = []
+
+                def _collect_filelike(fileobj) -> bytes:
+                    if isinstance(fileobj, (str, os.PathLike)):
+                        with open(fileobj, "rb") as rf:
+                            return rf.read()
+                    try:
+                        fileobj.seek(0)
+                    except Exception:
+                        pass
+                    return fileobj.read() if hasattr(fileobj, "read") else bytes(fileobj)
+
+                async def finished_callback(sink, *args):
+                    try:
+                        # デバッグ：どのユーザーが来たか
+                        print("[STT] users in window:", list(sink.audio_data.keys()))
+                        for user_id, data in sink.audio_data.items():
+                            uid = int(user_id)
+                            f = data.file
+                            # 空WAVは弾く
+                            size = None
+                            if isinstance(f, (str, os.PathLike)):
+                                try: size = os.path.getsize(f)
+                                except: size = None
+                            else:
+                                try:
+                                    p = f.tell(); f.seek(0, os.SEEK_END)
+                                    size = f.tell(); f.seek(p)
+                                except: size = None
+                            if size is not None and size <= 44:
+                                continue
+                            buf = _collect_filelike(f)
+                            captured.append((uid, data, buf))
+                    finally:
+                        done.set()
+
+                # start_recording（取り残しがあると例外になる）
                 try:
-                    for user_id, data in sink.audio_data.items():
-                        name = await resolve_display_name(g, int(user_id), data)
-                        buf = _collect_filelike(data.file)
-                        captured.append((name, buf))
-                finally:
-                    done.set()
+                    print(f"[STT] start_recording() rec={getattr(vc,'recording',None)}")
+                    vc.start_recording(sink, finished_callback)
+                except Exception as e:
+                    print("[STT] start_recording failed:", repr(e))
+                    # すでに録音中なら止めて次ループ
+                    if "Already recording" in str(e):
+                        await ensure_stopped(vc, "after start fail")
+                        await asyncio.sleep(0.3)
+                        continue
+                    await asyncio.sleep(1.0)
+                    continue
 
-            try:
-                print("[STT] start_recording()")
-                vc.start_recording(sink, finished_callback)
-            except Exception as e:
-                print("[STT] start_recording failed:", repr(e))
-                await asyncio.sleep(2.0)
-                continue
+                window = st["record_window"]
+                await asyncio.sleep(window)
 
-            window = get_state(guild_id)["record_window"]
-            await asyncio.sleep(window)
+                # 停止（同期）
+                try:
+                    print("[STT] stop_recording()")
+                    vc.stop_recording()
+                except Exception as e:
+                    print("[STT] stop_recording failed:", repr(e))
 
-            # 停止は同期関数
-            try:
-                print("[STT] stop_recording()")
-                vc.stop_recording()
-            except Exception as e:
-                print("[STT] stop_recording failed:", repr(e))
+                await done.wait()
+                await ensure_stopped(vc, "after stop")  # 念のため
 
-            await done.wait()
+            # ここまでが1サイクル（ロック解放）
 
             if not captured:
                 print("[STT] no audio captured in this window")
@@ -629,14 +786,25 @@ async def stt_worker(guild_id: int, channel_id: int):
                 continue
 
             # Whisper へ
-            jobs = [transcribe_and_post_from_bytes(buf, ch, username) for (username, buf) in captured]
+            jobs = []
+            for (uid, data, buf) in captured:
+                name = await resolve_display_name(guild_obj, uid, data)
+                jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, buf, dest))
             await asyncio.gather(*jobs, return_exceptions=True)
 
     except asyncio.CancelledError:
         print("[STT] worker cancelled", guild_id)
+        # キャンセル時も録音残ってたら止める
+        vc = guild_obj.voice_client
+        if vc and vc.is_connected():
+            await ensure_stopped(vc, "on cancel")
     except Exception as e:
         print("[STT] worker crashed:", repr(e))
         traceback.print_exc()
+        # クラッシュ時も安全弁
+        vc = guild_obj.voice_client
+        if vc and vc.is_connected():
+            await ensure_stopped(vc, "on crash")
     finally:
         print("[STT] worker end", guild_id)
 
@@ -678,8 +846,8 @@ async def record_once(guild: discord.Guild, seconds: int):
     async def finished_callback(sink, *args):
         try:
             for user_id, data in sink.audio_data.items():
-                name = await resolve_display_name(g, int(user_id), data)
-                fileobj = data.file  # path or BytesIO
+                name = await resolve_display_name(guild, int(user_id), data)
+                fileobj = data.file
 
                 # bytes へ落とす
                 if isinstance(fileobj, (str, os.PathLike)):
@@ -710,33 +878,44 @@ async def record_once(guild: discord.Guild, seconds: int):
     await done.wait()
     return results
 
-async def transcribe_and_post_from_bytes(buf: bytes, channel, username: str):
-    print(f"start: transcribe_and_post_from_bytes")
+async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: str, buf: bytes, channel):
     if not openai:
         print("[STT] OpenAI client is None"); return
+    st = get_state(guild_id)
+
+    # --- VAD（無音スキップの条件を緩める）---
+    try:
+        dur, rms = wav_stats(buf)
+        # WAVのメタ不整合で dur=0.0 のことがあるので概算も用意（48kHz/16bit/2ch ≒ 192kB/s）
+        if dur == 0.0 and len(buf) > 44:
+            dur = len(buf) / 192000.0
+        db = _dbfs_from_rms(rms)
+        print(f"[STT] segment stats: dur={dur:.2f}s rms={rms:.4f} ({db:.1f} dBFS)")
+
+        # 「短い かつ 小さい かつ 静か」ならスキップ（AND）
+        should_skip = (dur < st["min_dur"]) and (rms < st["vad_rms"]) and (db < st["vad_db"])
+        if should_skip:
+            print("[STT] skip by VAD")
+            return
+    except Exception:
+        traceback.print_exc()
+
+    # --- Whisper ---
     tmp = None; fh = None
     try:
-        # デバッグ（出なくても動作には影響しない）
-        try:
-            dur, rms = wav_stats(buf)
-            print(f"[STT] segment stats: dur={dur:.2f}s rms={rms:.3f}")
-        except Exception:
-            traceback.print_exc()
-
         tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         tmp = tf.name; tf.write(buf); tf.close()
         fh = open(tmp, "rb")
 
-        resp = openai.audio.transcriptions.create(
-            file=fh, model="whisper-1", language="ja"
-        )
+        kwargs = {}
+        if st["lang"] != "auto":
+            kwargs["language"] = st["lang"]
+
+        resp = openai.audio.transcriptions.create(file=fh, model="whisper-1", **kwargs)
         text = (getattr(resp, "text", "") or "").strip()
         print(f"[STT] Whisper result: {text!r}")
         if text:
-            try:
-                await channel.send(f"🎤 **{username}**: {text}")
-            except Exception as e:
-                print("[STT] send failed:", repr(e))
+            await post_caption(guild_id, channel, user_id, username, jp_cleanup(text))
     except Exception as e:
         print("[STT] Transcription failed:", repr(e))
         traceback.print_exc()
@@ -747,5 +926,6 @@ async def transcribe_and_post_from_bytes(buf: bytes, channel, username: str):
             if tmp:
                 try: os.remove(tmp)
                 except: pass
+
 
 bot.run(TOKEN)
