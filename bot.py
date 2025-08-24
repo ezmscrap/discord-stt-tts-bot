@@ -37,6 +37,52 @@ guild_state = {}  # guild_id -> dict( read_channel_id, stt_on, record_window )
 
 DEFAULT_WINDOW = 10  # 秒ごとに録音を区切って字幕化
 
+# === 追加：話速・声色プロファイルとFFmpegフィルタ生成 ===
+VOICE_PROFILES = [
+    {"name": "alto",     "semitones": -2, "tempo": 1.15},  # ちょい低め・やや速い
+    {"name": "neutral",  "semitones":  0, "tempo": 1.25},  # 標準ピッチ・速い
+    {"name": "bright",   "semitones": +4, "tempo": 1.20},  # 高め・少し速い
+    {"name": "deep",     "semitones": -5, "tempo": 1.12},  # 低め・少し速い
+]
+
+# 環境変数で全体の基準話速を上書き可能（デフォルト 1.25）
+BASE_TTS_TEMPO = float(os.getenv("TTS_TEMPO", "1.25"))
+
+def _pick_voice_profile(user_id: int | None) -> dict:
+    if user_id is None:
+        return {"name": "neutral", "semitones": 0, "tempo": 1.0}
+    return VOICE_PROFILES[user_id % len(VOICE_PROFILES)]
+
+def _atempo_chain(x: float) -> list[str]:
+    # FFmpegの atempo は 0.5〜2.0 の範囲なので分割
+    chain = []
+    while x > 2.0:
+        chain.append("atempo=2.0")
+        x /= 2.0
+    while x < 0.5:
+        chain.append("atempo=0.5")
+        x /= 0.5
+    chain.append(f"atempo={x:.4f}")
+    return chain
+
+def _build_ffmpeg_afilter(semitones: float, final_tempo: float) -> str:
+    """
+    semitones: ピッチ上下（+で高く）
+    final_tempo: 最終的な話速倍率（>1で速い）
+    ピッチは asetrate で上げ下げ → atempo で速度を調整。
+    """
+    # ピッチ係数（半音×12 → 2^(n/12)）
+    pitch_factor = 2.0 ** (semitones / 12.0)
+    # asetrate で速度も pitch_factor 倍になるので、atempo で目標話速へ補正
+    # つまり total_atempo = final_tempo / pitch_factor
+    total_atempo = final_tempo / max(pitch_factor, 1e-6)
+
+    # サンプルレートは 48kHz に統一（Discord向けに安定）
+    parts = [f"asetrate=48000*{pitch_factor:.6f}", "aresample=48000"]
+    parts += _atempo_chain(total_atempo)
+    # カンマで連結・スペース不要（Windowsのffmpegでのクォート回避）
+    return ",".join(parts)
+
 def _dbfs_from_rms(rms: float) -> float:
     if rms <= 1e-9:
         return -120.0
@@ -368,6 +414,18 @@ async def rectest(ctx: commands.Context, seconds: int = 5):
 
     await done.wait()
 
+def _pick_voice_profile_for_user(guild_id: int, user_id: int | None) -> dict:
+    """ギルド設定の override を最優先。なければVOICESを user_id で安定割当。"""
+    st = get_state(guild_id)
+    if user_id is not None:
+        ov = st["tts_overrides"].get(int(user_id))
+        if ov:  # 明示オーバーライド
+            return {"name": "custom", "semitones": ov.get("semitones", 0.0), "tempo": ov.get("tempo", 1.0)}
+        # 自動割当
+        base = VOICE_PROFILES[user_id % len(VOICE_PROFILES)]
+        return base
+    return {"name": "neutral", "semitones": 0.0, "tempo": 1.0}
+
 def get_state(guild_id):
     if guild_id not in guild_state:
         guild_state[guild_id] = dict(
@@ -375,22 +433,19 @@ def get_state(guild_id):
             stt_on=False,
             record_window=DEFAULT_WINDOW,
             stt_task=None,
-            # VADデフォルトを見直し
-            vad_rms=0.008,     # 以前0.02 → 下げる
-            vad_db=-46.0,      # 追加（dBFS）
-            min_dur=0.4,       # 以前0.8 → 0.4s
-            # 追記マージ
-            merge_window=15.0, # 初期値少し長め
-            merge_auto=True,   # ★ 追加: record_windowに追従
-            # 言語・投稿先
+            vad_rms=0.02,
+            min_dur=0.8,
+            merge_window=6.0,
             lang="ja",
             use_thread=False,
             caption_dest_id=None,
-            # ★ 変更: { str(channel_id): { str(user_id): {"message": Message, "ts": float} } }
             last_msgs={},
             rec_lock=asyncio.Lock(),
+            tts_base_tempo=float(os.getenv("TTS_TEMPO", "1.25")),  # サーバー全体の基準話速
+            tts_overrides={},   # { user_id: {"semitones": float, "tempo": float} }
         )
     return guild_state[guild_id]
+
 
 async def ensure_stopped(vc: discord.VoiceClient, why: str = ""):
     """録音が残っていれば強制停止して、少し待つ"""
@@ -415,22 +470,32 @@ def sanitize_for_tts(text: str) -> str:
     text = re.sub(r"https?://\S+", "リンク", text)
     return text[:400]
 
-async def tts_play(guild: discord.Guild, text: str):
+async def tts_play(guild: discord.Guild, text: str, speaker_id: int | None = None):
     vc: discord.VoiceClient = guild.voice_client
     if not vc or not vc.is_connected():
         return
-    # gTTS → mp3 → FFmpegPCMAudio で再生
+
+    st = get_state(guild.id)
+
+    prof = _pick_voice_profile_for_user(guild.id, speaker_id)
+    # サーバー基準 × 各話者のテンポ（安全にクリップ）
+    final_tempo = st["tts_base_tempo"] * prof.get("tempo", 1.0)
+    final_tempo = max(0.5, min(2.5, final_tempo))
+    semitones = float(prof.get("semitones", 0.0))
+
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         tmp_path = f.name
     try:
         gTTS(text=sanitize_for_tts(text), lang=TTS_LANG).save(tmp_path)
-        audio = discord.FFmpegPCMAudio(tmp_path)
+        af = _build_ffmpeg_afilter(semitones=semitones, final_tempo=final_tempo)
+        audio = discord.FFmpegPCMAudio(tmp_path, options=f"-vn -af {af}")
         vc.play(audio)
         while vc.is_playing():
             await asyncio.sleep(0.2)
     finally:
         try: os.remove(tmp_path)
         except: pass
+
 
 @bot.event
 async def on_ready():
@@ -620,8 +685,85 @@ async def on_message(message: discord.Message):
     if st["read_channel_id"] == message.channel.id and text:
         display = message.author.display_name if isinstance(message.author, discord.Member) else message.author.name
         to_say = f"{display}：{text}"
-        await tts_play(message.guild, to_say)
+        await tts_play(message.guild, to_say, speaker_id=message.author.id)
+
+@bot.command(name="ttsspeed", aliases=["読み上げ速度"])
+async def ttsspeed(ctx: commands.Context, ratio: str = None):
+    if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+        return await ctx.reply("このコマンドはサーバー管理者のみ実行できます。")
+    if not ratio:
+        return await ctx.reply("使い方: `!ttsspeed 1.35`  （推奨: 0.6〜2.0）")
+
+    try:
+        r = float(ratio)
+        if not (0.4 <= r <= 3.0):
+            return await ctx.reply("値が広すぎます。0.4〜3.0 の範囲で指定してください（推奨 0.6〜2.0）。")
+    except Exception:
+        return await ctx.reply("数値で指定してください。例: `!ttsspeed 1.25`")
+
+    st = get_state(ctx.guild.id)
+    st["tts_base_tempo"] = r
+    await ctx.reply(f"✅ サーバー基準の読み上げ話速を **{r:.2f}倍** に設定しました。")
+
+@bot.command(name="ttsvoice", aliases=["声色"])
+async def ttsvoice(ctx: commands.Context, member: discord.Member = None, semitones: str = None, tempo: str = None):
+    if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+        return await ctx.reply("このコマンドはサーバー管理者のみ実行できます。")
+
+    if member is None or semitones is None:
+        return await ctx.reply(
+            "使い方:\n"
+            "- `!ttsvoice @ユーザー +3 1.15`  … 半音+3 / テンポ1.15倍\n"
+            "- `!ttsvoice @ユーザー reset`   … 個別設定を解除\n"
+            "  ※テンポは省略可（省略時は1.0）"
+        )
+
+    st = get_state(ctx.guild.id)
+
+    if semitones.lower() == "reset":
+        st["tts_overrides"].pop(member.id, None)
+        return await ctx.reply(f"🔄 {member.display_name} の個別声設定をリセットしました。")
+
+    # "+3" や "-5" などに対応
+    try:
+        if semitones.startswith(("+", "-")):
+            semi = float(semitones)
+        else:
+            semi = float(semitones)  # "3" も許可
+    except Exception:
+        return await ctx.reply("半音は数値で指定してください（例: +3, -2, 0）。")
+
+    try:
+        t = 1.0 if tempo is None else float(tempo)
+        if not (0.5 <= (t * st["tts_base_tempo"]) <= 2.5):
+            # 実効話速（サーバー基準×個別）の安全範囲をざっくりチェック
+            pass
+    except Exception:
+        return await ctx.reply("テンポは数値で指定してください（例: 1.10）。")
+
+    st["tts_overrides"][member.id] = {"semitones": semi, "tempo": t}
+    await ctx.reply(
+        f"✅ {member.display_name} の声色を設定しました： 半音 **{semi:+.1f}**, テンポ係数 **{t:.2f}**"
+    )
     
+@bot.command(name="ttsconfig", aliases=["読み上げ設定"])
+async def ttsconfig(ctx: commands.Context):
+    st = get_state(ctx.guild.id)
+    lines = [
+        f"🔧 **TTS設定**",
+        f"- サーバー基準話速: x{st['tts_base_tempo']:.2f}",
+        f"- 個別設定数: {len(st['tts_overrides'])}",
+    ]
+    if st["tts_overrides"]:
+        lines.append("- 個別設定（最大10件表示）:")
+        for uid, ov in list(st["tts_overrides"].items())[:10]:
+            m = ctx.guild.get_member(uid)
+            name = m.display_name if m else f"User {uid}"
+            lines.append(f"  • {name}: semitones={ov.get('semitones',0):+.1f}, tempo={ov.get('tempo',1.0):.2f}")
+        if len(st["tts_overrides"]) > 10:
+            lines.append(f"  …ほか {len(st['tts_overrides']) - 10} 件")
+    await ctx.reply("\n".join(lines))
+
 @bot.command(name="sttset")
 async def sttset(ctx, key: str=None, value: str=None):
     """
