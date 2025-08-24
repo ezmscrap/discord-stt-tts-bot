@@ -745,7 +745,7 @@ async def ttsvoice(ctx: commands.Context, member: discord.Member = None, semiton
     await ctx.reply(
         f"✅ {member.display_name} の声色を設定しました： 半音 **{semi:+.1f}**, テンポ係数 **{t:.2f}**"
     )
-    
+
 @bot.command(name="ttsconfig", aliases=["読み上げ設定"])
 async def ttsconfig(ctx: commands.Context):
     st = get_state(ctx.guild.id)
@@ -1068,6 +1068,182 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
             if tmp:
                 try: os.remove(tmp)
                 except: pass
+# =========================
+# Help コマンド（カスタム）
+# =========================
+
+def _is_admin_ctx(ctx: commands.Context) -> bool:
+    perms = getattr(ctx.author, "guild_permissions", None)
+    return bool(perms and (perms.manage_guild or perms.administrator))
+
+# コマンド定義（書式と説明）
+_HELP_ITEMS = [
+    {
+        "name": "join", "aliases": ["執事参加","執事入室","執事召喚"],
+        "usage": "{p}join",
+        "desc": "今いるボイスチャンネルへボットを参加させます（Stage では話者化を試みます）。",
+    },
+    {
+        "name": "leave", "aliases": ["執事退出","執事離脱"],
+        "usage": "{p}leave",
+        "desc": "ボイスチャンネルから退出します。",
+    },
+    {
+        "name": "readon", "aliases": ["読み上げコマンド","読み上げ","読み上げ開始","読み上げオン","このチャンネルを読み上げ"],
+        "usage": "{p}readon",
+        "desc": "このテキストチャンネルの新規メッセージをボイスチャンネルで読み上げます。",
+    },
+    {
+        "name": "readoff", "aliases": ["読み上げ停止","読み上げオフ"],
+        "usage": "{p}readoff",
+        "desc": "読み上げを停止します。",
+    },
+    {
+        "name": "readhere", "aliases": ["ここを読み上げ"],
+        "usage": "{p}readhere",
+        "desc": "読み上げ対象チャンネルを“今ここ”に変更します。",
+    },
+    {
+        "name": "stton", "aliases": ["字幕開始","文字起こし開始","字幕オン","音声認識開始"],
+        "usage": "{p}stton [区切り秒数(3-60)]",
+        "desc": "ボイスチャンネルの音声を区切って文字起こしし、ここ（またはスレッド）に投稿します。",
+    },
+    {
+        "name": "sttoff", "aliases": ["字幕停止","文字起こし停止","字幕オフ","音声認識停止"],
+        "usage": "{p}sttoff",
+        "desc": "音声認識ワーカーを停止します。",
+    },
+    {
+        "name": "stttest", "aliases": ["文字起こしテスト"],
+        "usage": "{p}stttest",
+        "desc": "gTTS→Whisper の疎通テストを行います（日本語固定）。",
+    },
+    {
+        "name": "rectest", "aliases": ["録音テスト"],
+        "usage": "{p}rectest [秒数(2-30)]",
+        "desc": "現在のボイスチャンネルを一時録音し、結果を返信します（デバッグ用）。",
+    },
+    {
+        "name": "diag", "aliases": ["診断"],
+        "usage": "{p}diag",
+        "desc": "py-cord のバージョンや ffmpeg/PyNaCl などの診断情報を表示します。",
+    },
+    {
+        "name": "whereami", "aliases": [],
+        "usage": "{p}whereami",
+        "desc": "このテキストチャンネル（またはスレッド）の情報を表示します。",
+    },
+    {
+        "name": "intentcheck", "aliases": [],
+        "usage": "{p}intentcheck",
+        "desc": "Members Intent 等の実際の挙動を簡易チェックします。",
+    },
+    {
+        "name": "sttset", "aliases": [],
+        "usage": (
+            "{p}sttset vad <rms> | vaddb <dB> | mindur <秒> | merge <秒> | "
+            "mergeauto on/off | lang <auto/ja/en> | thread on/off"
+        ),
+        "desc": (
+            "VADしきい値・最小長・マージ時間・言語・スレッド運用などを調整します。"
+            " 例: `{p}sttset vad 0.008`, `{p}sttset lang auto`, `{p}sttset thread on`"
+        ),
+    },
+    # ==== 管理者向け（表示制御） ====
+    {
+        "name": "ttsspeed", "aliases": ["読み上げ速度"],
+        "usage": "{p}ttsspeed <倍率>",
+        "desc": "サーバー全体の基準話速を設定します。例: `1.35`（推奨 0.6〜2.0）",
+        "admin_only": True,
+    },
+    {
+        "name": "ttsvoice", "aliases": ["声色"],
+        "usage": "{p}ttsvoice @ユーザー (<半音> [テンポ] | reset)",
+        "desc": "特定ユーザーの声色（半音）とテンポ係数を上書きします。例: `@太郎 +3 1.10` / `reset`",
+        "admin_only": True,
+    },
+    {
+        "name": "ttsconfig", "aliases": ["読み上げ設定"],
+        "usage": "{p}ttsconfig",
+        "desc": "現在の話速・個別声色オーバーライドの一覧を表示します。",
+        "admin_only": True,
+    },
+]
+
+def _find_help_item(name: str):
+    n = name.lower()
+    for item in _HELP_ITEMS:
+        if item["name"].lower() == n or n in [a.lower() for a in item.get("aliases", [])]:
+            return item
+    return None
+
+def _format_cmd_line(item: dict, prefix: str) -> tuple[str, str]:
+    """Embed のフィールド (name, value) を返す"""
+    aliases = item.get("aliases") or []
+    alias_str = (" / " + " / ".join(aliases)) if aliases else ""
+    admin_tag = " 🔒" if item.get("admin_only") else ""
+    name = f"{prefix}{item['name']}{alias_str}{admin_tag}"
+    usage = (item["usage"] or "").format(p=prefix)
+    desc = (item["desc"] or "").format(p=prefix)
+    value = f"**書式**: `{usage}`\n{desc}"
+    return name, value
+
+@bot.command(name="help")
+async def help_command(ctx: commands.Context, *, command_name: str = None):
+    """カスタムヘルプ: !help / !help <コマンド名>"""
+    prefix = ctx.prefix or "!"
+    is_admin = _is_admin_ctx(ctx)
+
+    # 個別ヘルプ（!help stton のように指定された場合）
+    if command_name:
+        item = _find_help_item(command_name)
+        if not item:
+            return await ctx.reply(f"`{command_name}` のヘルプは見つかりませんでした。`{prefix}help` で一覧を表示します。")
+        if item.get("admin_only") and not is_admin:
+            return await ctx.reply("このコマンドはサーバー管理者向けです。")
+        name, value = _format_cmd_line(item, prefix)
+        emb = discord.Embed(
+            title="📖 コマンドヘルプ",
+            description=f"`{prefix}{item['name']}` の説明です。",
+            color=discord.Color.blurple(),
+        )
+        emb.add_field(name=name, value=value, inline=False)
+        return await ctx.reply(embed=emb)
+
+    # 一覧ヘルプ
+    emb = discord.Embed(
+        title="📖 ヘルプ — ボイス字幕ボット",
+        description=(
+            f"プレフィックス: `{prefix}`\n"
+            f"詳細は `{prefix}help <コマンド名>` で確認できます。"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    # 実行者が使えるコマンドのみ表示
+    visible_items = [
+        x for x in _HELP_ITEMS
+        if (not x.get("admin_only") or is_admin)
+    ]
+
+    # 見やすい順に並べ替え（お好みで）
+    order = ["join","leave","readon","readoff","readhere","stton","sttoff",
+             "stttest","rectest","diag","whereami","intentcheck","sttset",
+             "ttsspeed","ttsvoice","ttsconfig"]
+    sort_key = {name:i for i,name in enumerate(order)}
+    visible_items.sort(key=lambda x: sort_key.get(x["name"], 999))
+
+    for item in visible_items:
+        name, value = _format_cmd_line(item, prefix)
+        emb.add_field(name=name, value=value, inline=False)
+
+    # フッター
+    if not is_admin:
+        emb.set_footer(text="🔒 が付いた項目はサーバー管理者向けです。")
+    else:
+        emb.set_footer(text="管理者向けのコマンドも表示しています。")
+
+    await ctx.reply(embed=emb)
 
 
 bot.run(TOKEN)
