@@ -1,2 +1,20 @@
+# Environment variables
 .env
+
+# Python
 .venv
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs & audio artifacts
+*.log
+*.wav
+*.mp3
