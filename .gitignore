@@ -15,6 +15,7 @@ __pycache__/
 .DS_Store
 
 # Logs & audio artifacts
+logs/
 *.log
 *.wav
 *.mp3

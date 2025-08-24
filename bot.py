@@ -18,10 +18,23 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "ja")
 
-LOG_DIR = BASE_DIR / "logs"
+def _resolve_log_dir(base_dir: Path, env_value: str | None) -> Path:
+    # 空 or 未設定 → デフォルト "logs"
+    if not env_value or not env_value.strip():
+        return base_dir / "logs"
+    # ~ と 環境変数 を展開
+    expanded = os.path.expanduser(os.path.expandvars(env_value.strip()))
+    p = Path(expanded)
+    # 相対パスなら BASE_DIR 基準に
+    if not p.is_absolute():
+        p = base_dir / p
+    return p
+
+LOG_DIR = _resolve_log_dir(BASE_DIR, os.getenv("LOG_DIR"))
 TTS_LOG_PATH = LOG_DIR / "tts_logs.csv"
 STT_LOG_PATH = LOG_DIR / "stt_logs.csv"
 _log_lock = asyncio.Lock()  # 複数タスクからの同時書き込みを保護
+print(f"[LOG] output directory: {LOG_DIR}")  # 起動時に出力先を表示
 
 def _ensure_csv_with_header(path: Path, headers: list[str]):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +109,7 @@ async def log_stt_event(
 
 
 if OPENAI_API_KEY:
-    print(f"[STT] OPENAI_API_KEY detected: ****{OPENAI_API_KEY[-6:]}")
+    print(f"[STT] OPENAI_API_KEY detected.")
 else:
     print("[STT] OPENAI_API_KEY NOT found (Whisperは動きません)")
 

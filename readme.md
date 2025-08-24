@@ -39,7 +39,8 @@ cp .env.example .env
 DISCORD_TOKEN=あなたのBotトークン
 OPENAI_API_KEY=（音声認識にOpenAI Whisper APIを使う場合のみ）
 TTS_LANG=ja
-TTS_TEMPO=1.25
+TTS_TEMPO=1.05
+LOG_DIR=logs
 ```
 
 2. 仮想環境を作成して有効化
@@ -161,11 +162,13 @@ python bot.py
   `!sttset vad 0.008` / `!sttset vaddb -48` / `!sttset mindur 0.4` など
 
 * **読み上げが遅い**
-  `!ttsspeed 1.35` のように話速を上げる、またはユーザー個別に `!ttsvoice @ユーザー +3 1.15` などでテンポ係数を上げてください。
+  `!ttsspeed 1.1` のように話速を上げる、またはユーザー個別に `!ttsvoice @ユーザー +3 1.15` などでテンポ係数を上げてください。あるいは、 .env の TTS_TEMPO の値を大きくすることで速度を上げることが可能です。
 
 * **Stage チャンネルで話せない**
   モデレーター承認が必要な場合があります（`!join` 後に自動でリクエストしますが、権限により失敗することがあります）。
 
+* **logファイルを出す場所を変えたい**
+  .env の LOG_DIR で指定してください。
 ---
 
 ## セキュリティと費用
