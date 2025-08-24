@@ -45,14 +45,6 @@ VOICE_PROFILES = [
     {"name": "deep",     "semitones": -5, "tempo": 1.12},  # 低め・少し速い
 ]
 
-# 環境変数で全体の基準話速を上書き可能（デフォルト 1.25）
-BASE_TTS_TEMPO = float(os.getenv("TTS_TEMPO", "1.25"))
-
-def _pick_voice_profile(user_id: int | None) -> dict:
-    if user_id is None:
-        return {"name": "neutral", "semitones": 0, "tempo": 1.0}
-    return VOICE_PROFILES[user_id % len(VOICE_PROFILES)]
-
 def _atempo_chain(x: float) -> list[str]:
     # FFmpegの atempo は 0.5〜2.0 の範囲なので分割
     chain = []
@@ -360,6 +352,17 @@ async def rectest(ctx: commands.Context, seconds: int = 5):
     # WaveSink でユーザー別にWAVを生成
     sink = discord.sinks.WaveSink()
     done = asyncio.Event()
+    captured = []
+
+    def _collect_filelike(fileobj) -> bytes:
+        if isinstance(fileobj, (str, os.PathLike)):
+            with open(fileobj, "rb") as rf:
+                return rf.read()
+        try:
+            fileobj.seek(0)
+        except Exception:
+            pass
+        return fileobj.read() if hasattr(fileobj, "read") else bytes(fileobj)
 
     async def finished_callback(sink, *args):
         try:
