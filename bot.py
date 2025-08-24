@@ -29,7 +29,7 @@ intents.voice_states = True
 intents.messages = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -1188,7 +1188,7 @@ def _format_cmd_line(item: dict, prefix: str) -> tuple[str, str]:
     value = f"**書式**: `{usage}`\n{desc}"
     return name, value
 
-@bot.command(name="llkhelp")
+@bot.command(name="help", aliases=["h"])
 async def help_command(ctx: commands.Context, *, command_name: str = None):
     """カスタムヘルプ: !help / !help <コマンド名>"""
     prefix = ctx.prefix or "!"
