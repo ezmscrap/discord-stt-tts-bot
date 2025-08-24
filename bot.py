@@ -741,7 +741,7 @@ async def stton(ctx: commands.Context, window: int | None = None):
     await ctx.reply(f"🎧 音声認識を開始（{st['record_window']}秒区切り）。投稿先: <#{dest.id}> / OpenAI鍵: {'あり' if openai else 'なし'}")
 
 
-@bot.command(name="sttoff", aliases=["字幕停止","文字起こし停止","字幕オフ","音声認識停止"])
+@bot.command(name="sttoff", aliases=["字幕停止","字幕終了","文字起こし停止","字幕オフ","音声認識停止"])
 async def sttoff(ctx: commands.Context):
     st = get_state(ctx.guild.id)
     if st.get("stt_task") and not st["stt_task"].done():
