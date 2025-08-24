@@ -1,7 +1,8 @@
-import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time
+import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time,csv
 import discord
 import typing as T
 
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from discord import StageChannel, TextChannel, Thread
 from discord.abc import Messageable
@@ -16,6 +17,83 @@ load_dotenv(BASE_DIR / ".env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "ja")
+
+LOG_DIR = BASE_DIR / "logs"
+TTS_LOG_PATH = LOG_DIR / "tts_logs.csv"
+STT_LOG_PATH = LOG_DIR / "stt_logs.csv"
+_log_lock = asyncio.Lock()  # 複数タスクからの同時書き込みを保護
+
+def _ensure_csv_with_header(path: Path, headers: list[str]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+
+# 初期化（ヘッダ行を用意）
+_ensure_csv_with_header(
+    TTS_LOG_PATH,
+    ["timestamp_iso", "guild_id", "channel_id", "message_id", "author_id", "author_display", "text"],
+)
+_ensure_csv_with_header(
+    STT_LOG_PATH,
+    ["timestamp_iso", "guild_id", "dest_channel_id", "user_id", "user_display", "text", "duration_sec", "rms", "dbfs"],
+)
+
+def _norm_text_for_csv(text: str) -> str:
+    return (text or "").replace("\r", " ").replace("\n", " ").strip()
+
+async def _append_csv(path: Path, row: list):
+    async with _log_lock:
+        # 失敗しても bot 全体を止めない
+        try:
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(row)
+        except Exception as e:
+            print(f"[LOG] write failed for {path.name}:", repr(e))
+
+async def log_tts_event(message: discord.Message, spoken_text: str):
+    """読み上げたテキストのログ（入力者・入力時刻付き）"""
+    ts = message.created_at
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    row = [
+        ts.astimezone(timezone.utc).isoformat(),
+        message.guild.id if message.guild else 0,
+        message.channel.id if hasattr(message, "channel") else 0,
+        message.id,
+        message.author.id if message.author else 0,
+        (message.author.display_name if isinstance(message.author, discord.Member) else getattr(message.author, "name", "unknown")),
+        _norm_text_for_csv(spoken_text),
+    ]
+    await _append_csv(TTS_LOG_PATH, row)
+
+async def log_stt_event(
+    guild_id: int,
+    dest_channel_id: int | None,
+    user_id: int,
+    user_display: str,
+    text: str,
+    duration: float | None,
+    rms: float | None,
+    dbfs: float | None,
+):
+    """音声認識結果のログ（発言者・発言時間（記録時刻）付き）"""
+    ts = datetime.now(timezone.utc).isoformat()
+    row = [
+        ts,
+        guild_id or 0,
+        dest_channel_id or 0,
+        user_id,
+        user_display,
+        _norm_text_for_csv(text),
+        f"{duration:.3f}" if isinstance(duration, (int, float)) else "",
+        f"{rms:.6f}" if isinstance(rms, (int, float)) else "",
+        f"{dbfs:.2f}" if isinstance(dbfs, (int, float)) else "",
+    ]
+    await _append_csv(STT_LOG_PATH, row)
+
 
 if OPENAI_API_KEY:
     print(f"[STT] OPENAI_API_KEY detected: ****{OPENAI_API_KEY[-6:]}")
@@ -444,7 +522,7 @@ def get_state(guild_id):
             caption_dest_id=None,
             last_msgs={},
             rec_lock=asyncio.Lock(),
-            tts_base_tempo=float(os.getenv("TTS_TEMPO", "1.25")),  # サーバー全体の基準話速
+            tts_base_tempo=float(os.getenv("TTS_TEMPO", "0.7")),  # サーバー全体の基準話速
             tts_overrides={},   # { user_id: {"semitones": float, "tempo": float} }
         )
     return guild_state[guild_id]
@@ -678,17 +756,21 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
     if not message.guild or message.author.bot:
         return
-    
+
     # コマンドは読まないようにする
     text = (message.content or "").strip()
     if text.startswith(("!", "！")):
         return
-    
+
     st = get_state(message.guild.id)
     if st["read_channel_id"] == message.channel.id and text:
         display = message.author.display_name if isinstance(message.author, discord.Member) else message.author.name
         to_say = f"{display}：{text}"
         await tts_play(message.guild, to_say, speaker_id=message.author.id)
+
+        # ★ ログ: 読み上げたテキスト（元入力）・投稿者・入力時間
+        # 「読み上げたテキスト」は message.content（TTS前の生テキスト）を残すのが要件に忠実
+        await log_tts_event(message, text)
 
 @bot.command(name="ttsspeed", aliases=["読み上げ速度"])
 async def ttsspeed(ctx: commands.Context, ratio: str = None):
@@ -1029,12 +1111,15 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
     st = get_state(guild_id)
 
     # --- VAD（無音スキップの条件を緩める）---
+    dur = None
+    rms = None
+    db = None
     try:
         dur, rms = wav_stats(buf)
-        # WAVのメタ不整合で dur=0.0 のことがあるので概算も用意（48kHz/16bit/2ch ≒ 192kB/s）
-        if dur == 0.0 and len(buf) > 44:
+        # WAVメタ不整合対策：概算長（48kHz/16bit/2ch ≒ 192kB/s）
+        if (dur == 0.0 or dur is None) and len(buf) > 44:
             dur = len(buf) / 192000.0
-        db = _dbfs_from_rms(rms)
+        db = _dbfs_from_rms(rms or 0.0)
         print(f"[STT] segment stats: dur={dur:.2f}s rms={rms:.4f} ({db:.1f} dBFS)")
 
         # 「短い かつ 小さい かつ 静か」ならスキップ（AND）
@@ -1059,8 +1144,24 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
         resp = openai.audio.transcriptions.create(file=fh, model="whisper-1", **kwargs)
         text = (getattr(resp, "text", "") or "").strip()
         print(f"[STT] Whisper result: {text!r}")
+
         if text:
+            # ★ ログ: 音声認識テキスト・発言者・記録時刻（近似）
+            dest_id = getattr(channel, "id", 0)
+            await log_stt_event(
+                guild_id=guild_id,
+                dest_channel_id=dest_id,
+                user_id=user_id,
+                user_display=username,
+                text=text,
+                duration=float(dur) if dur is not None else None,
+                rms=float(rms) if rms is not None else None,
+                dbfs=float(db) if db is not None else None,
+            )
+
+            # キャプション投稿（連投マージ対応）
             await post_caption(guild_id, channel, user_id, username, jp_cleanup(text))
+
     except Exception as e:
         print("[STT] Transcription failed:", repr(e))
         traceback.print_exc()
@@ -1071,6 +1172,8 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
             if tmp:
                 try: os.remove(tmp)
                 except: pass
+
+
 # =========================
 # Help コマンド（カスタム）
 # =========================
