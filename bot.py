@@ -120,8 +120,7 @@ intents.voice_states = True
 intents.messages = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-
+bot = commands.Bot(command_prefix=("!", "！"), intents=intents, help_command=None)
 openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 guild_state = {}  # guild_id -> dict( read_channel_id, stt_on, record_window )
