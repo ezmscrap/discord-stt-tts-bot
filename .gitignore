@@ -6,8 +6,25 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.eggs/
+*.egg
+*.whl
+build/
+dist/
+pip-wheel-metadata/
 .mypy_cache/
 .pytest_cache/
+.ruff_cache/
+.hypothesis/
+.nox/
+.tox/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+__pypackages__/
+.python-version
 
 # Editors/OS
 .vscode/

@@ -11,9 +11,20 @@ from gtts import gTTS
 from openai import OpenAI
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR = Path(__file__).resolve().parent
+SRC_DIR = PACKAGE_DIR.parent
+if SRC_DIR.name == "src":
+    PROJECT_ROOT = SRC_DIR.parent
+else:
+    PROJECT_ROOT = PACKAGE_DIR.parent
 
-load_dotenv(BASE_DIR / ".env")
+# 優先してリポジトリ直下の .env を読み込む。存在しない環境では既定の検索にフォールバック。
+dotenv_loaded = False
+candidate_env = PROJECT_ROOT / ".env"
+if candidate_env.exists():
+    dotenv_loaded = load_dotenv(candidate_env)
+if not dotenv_loaded:
+    load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "ja")
@@ -25,12 +36,12 @@ def _resolve_log_dir(base_dir: Path, env_value: str | None) -> Path:
     # ~ と 環境変数 を展開
     expanded = os.path.expanduser(os.path.expandvars(env_value.strip()))
     p = Path(expanded)
-    # 相対パスなら BASE_DIR 基準に
+    # 相対パスなら PROJECT_ROOT 基準に
     if not p.is_absolute():
         p = base_dir / p
     return p
 
-LOG_DIR = _resolve_log_dir(BASE_DIR, os.getenv("LOG_DIR"))
+LOG_DIR = _resolve_log_dir(PROJECT_ROOT, os.getenv("LOG_DIR"))
 TTS_LOG_PATH = LOG_DIR / "tts_logs.csv"
 STT_LOG_PATH = LOG_DIR / "stt_logs.csv"
 _log_lock = asyncio.Lock()  # 複数タスクからの同時書き込みを保護
@@ -581,7 +592,12 @@ async def tts_play(guild: discord.Guild, text: str, speaker_id: int | None = Non
     try:
         gTTS(text=sanitize_for_tts(text), lang=TTS_LANG).save(tmp_path)
         af = _build_ffmpeg_afilter(semitones=semitones, final_tempo=final_tempo)
-        audio = discord.FFmpegPCMAudio(tmp_path, options=f"-vn -af {af}")
+        # ffmpeg の警告出力を抑制し、CLI へのノイズを防ぐ
+        audio = discord.FFmpegPCMAudio(
+            tmp_path,
+            before_options="-loglevel quiet -nostdin",
+            options=f"-vn -af {af}"
+        )
         vc.play(audio)
         while vc.is_playing():
             await asyncio.sleep(0.2)
@@ -1364,4 +1380,11 @@ async def help_command(ctx: commands.Context, *, command_name: str = None):
     await ctx.reply(embed=emb)
 
 
-bot.run(TOKEN)
+def main() -> None:
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is not set. Update your environment or .env file.")
+    bot.run(TOKEN)
+
+
+if __name__ == "__main__":
+    main()
