@@ -4,6 +4,7 @@ Discord のボイスチャンネルで **テキスト読み上げ (TTS)** と **
 
 ## 主な機能
 - テキストチャンネルの投稿を gTTS + FFmpeg でリアルタイム読み上げ
+- VOICEVOX サーバーを指定した読み上げにも対応（ユーザーごとの話者ID設定をサポート）
 - ボイスチャンネルの音声を録音し、Whisper API で文字起こしして投稿
 - Stage チャンネル対応、字幕用スレッドの自動運用
 - 読み上げ速度や声色プロファイルのカスタマイズ
@@ -39,13 +40,17 @@ Discord のボイスチャンネルで **テキスト読み上げ (TTS)** と **
    ```bash
    cp .env.example .env
    ```
-5. `.env` に Discord のトークンと OpenAI API キー（必要なら）を設定
+5. `.env` に Discord のトークンと OpenAI API キー（必要なら）を設定し、`TTS_PROVIDER` を `gtts` または `voicevox` に指定
 6. 起動
    ```bash
    python -m discord_stt_tts_bot
    ```
 
-FFmpeg が未導入の場合は別途インストールし、`ffmpeg -version` で利用可能か確認してください。詳細なセットアップやコマンド一覧は `docs/usage.md` を参照してください。
+VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:50021`）や `VOICEVOX_DEFAULT_SPEAKER` を `.env` で設定してください。FFmpeg が未導入の場合は別途インストールし、`ffmpeg -version` で利用可能か確認してください。詳細なセットアップやコマンド一覧は `docs/usage.md` を参照してください。
+
+## 音声合成エンジンの切り替え
+- `TTS_PROVIDER=gtts` … 既定の gTTS を使用し、`!ttsspeed` や `!ttsvoice` で話速・声色を調整します。
+- `TTS_PROVIDER=voicevox` … `.env` の `VOICEVOX_BASE_URL` で指定した VOICEVOX エンジンを利用します。ユーザーごとの話者IDは `!ttsspeaker` コマンドでエクスポート／インポート・個別設定が可能です。
 
 ## ライセンス
 MIT License

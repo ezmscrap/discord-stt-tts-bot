@@ -31,6 +31,10 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
    OPENAI_API_KEY=（音声認識にOpenAI Whisper APIを使う場合のみ）
    TTS_LANG=ja
    TTS_TEMPO=1.05
+   TTS_PROVIDER=gtts            # gtts / voicevox を選択
+   VOICEVOX_BASE_URL=http://127.0.0.1:50021
+   VOICEVOX_DEFAULT_SPEAKER=2
+   VOICEVOX_TIMEOUT=15
    LOG_DIR=logs
    ```
 
@@ -116,17 +120,20 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 > 同一話者が続けて話した場合、`merge_window`（既定 6 秒、`!sttset merge` で変更）以内なら前のメッセージを編集で追記します。
 
 ### 読み上げ（TTS）管理（サーバー管理者のみ）
-- `!ttsspeed <倍率>` … サーバー全体の基準話速を変更（例: `!ttsspeed 1.35`）
-- `!ttsvoice @ユーザー <半音> [テンポ]` … 話者ごとの声色/話速係数を上書き
+- `!ttsspeed <倍率>` … サーバー全体の基準話速を変更（gTTS 利用時のみ。例: `!ttsspeed 1.35`）
+- `!ttsvoice @ユーザー <半音> [テンポ]` … 話者ごとの声色/話速係数を上書き（gTTS 利用時のみ）
   - 例: `!ttsvoice @太郎 +3 1.10` / 解除: `!ttsvoice @太郎 reset`
 - `!ttsconfig` … 現在の TTS 設定を表示
+- `!ttsspeaker ...` … VOICEVOX 利用時の話者IDを管理（`default` / `export` / `import` / `@ユーザー <id>` 等）
 
-> 読み上げは gTTS(日本語) → FFmpeg フィルタでピッチ（半音）と話速を調整して再生します。既定で話者ごとに声色が変わるよう自動割当されています（ユーザーIDベース）。
+> 読み上げを gTTS で行う場合は、FFmpeg フィルタでピッチ（半音）と話速を調整しています。既定で話者ごとに声色が変わるよう自動割り当てされます（ユーザーIDベース）。
+> VOICEVOX を選択した場合は、`.env` で `TTS_PROVIDER=voicevox` を設定し、`VOICEVOX_BASE_URL`/`VOICEVOX_DEFAULT_SPEAKER` と `!ttsspeaker` コマンドを組み合わせて管理します。
 
 ### デバッグ／補助
 - `!stttest` … gTTS→Whisper の疎通テスト
 - `!rectest [2-30]` … 一時録音テスト
 - `!diag` … 環境診断
+- `!logs` … TTS/STT のログファイル（CSV）を取得
 - `!whereami` … 現在のチャンネル情報
 - `!intentcheck` … intents の動作確認
 - `!help [コマンド名]` … コマンドヘルプを表示

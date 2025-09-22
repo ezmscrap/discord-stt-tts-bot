@@ -1,4 +1,4 @@
-import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time,csv
+import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time,csv, json
 import discord
 import typing as T
 
@@ -10,6 +10,7 @@ from discord.ext import commands, tasks
 from gtts import gTTS
 from openai import OpenAI
 from pathlib import Path
+import requests
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 SRC_DIR = PACKAGE_DIR.parent
@@ -28,6 +29,10 @@ if not dotenv_loaded:
 TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "ja")
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "gtts").strip().lower() or "gtts"
+VOICEVOX_BASE_URL = (os.getenv("VOICEVOX_BASE_URL", "http://127.0.0.1:50021").strip().rstrip("/"))
+VOICEVOX_TIMEOUT = float(os.getenv("VOICEVOX_TIMEOUT", "15"))
+VOICEVOX_DEFAULT_SPEAKER = int(os.getenv("VOICEVOX_DEFAULT_SPEAKER", "2"))
 
 def _resolve_log_dir(base_dir: Path, env_value: str | None) -> Path:
     # 空 or 未設定 → デフォルト "logs"
@@ -547,6 +552,8 @@ def get_state(guild_id):
             rec_lock=asyncio.Lock(),
             tts_base_tempo=float(os.getenv("TTS_TEMPO", "0.7")),  # サーバー全体の基準話速
             tts_overrides={},   # { user_id: {"semitones": float, "tempo": float} }
+            tts_default_speaker=VOICEVOX_DEFAULT_SPEAKER,
+            tts_speakers={},    # { user_id: speaker_id }
         )
     return guild_state[guild_id]
 
@@ -574,15 +581,63 @@ def sanitize_for_tts(text: str) -> str:
     text = re.sub(r"https?://\S+", "リンク", text)
     return text[:400]
 
+
+def _voicevox_request(text: str, speaker_id: int) -> bytes:
+    """VOICEVOX エンジンへ音声合成を依頼し、音声データ（WAV）のバイナリを返す。"""
+    params = {"text": text, "speaker": speaker_id}
+    query_url = f"{VOICEVOX_BASE_URL}/audio_query"
+    synth_url = f"{VOICEVOX_BASE_URL}/synthesis"
+
+    try:
+        query_resp = requests.post(query_url, params=params, timeout=VOICEVOX_TIMEOUT)
+        query_resp.raise_for_status()
+        query_payload = query_resp.json()
+        synth_resp = requests.post(
+            synth_url,
+            params={"speaker": speaker_id},
+            json=query_payload,
+            timeout=VOICEVOX_TIMEOUT,
+        )
+        synth_resp.raise_for_status()
+        return synth_resp.content
+    except Exception as exc:
+        print(f"[TTS] VOICEVOX synthesis failed: {exc!r}")
+        raise
+
+
+async def _voicevox_synthesize(text: str, speaker_id: int) -> bytes:
+    """VOICEVOX への同期リクエストをスレッドで実行し、音声バイト列を取得する。"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _voicevox_request(text, speaker_id))
+
 async def tts_play(guild: discord.Guild, text: str, speaker_id: int | None = None):
     vc: discord.VoiceClient = guild.voice_client
     if not vc or not vc.is_connected():
         return
 
     st = get_state(guild.id)
+    if TTS_PROVIDER == "voicevox":
+        await _tts_play_voicevox(vc, guild.id, text, speaker_id)
+        return
 
-    prof = _pick_voice_profile_for_user(guild.id, speaker_id)
-    # サーバー基準 × 各話者のテンポ（安全にクリップ）
+    await _tts_play_gtts(vc, guild.id, text, speaker_id, st)
+
+
+async def _play_vc_audio(vc: discord.VoiceClient, path: str):
+    """指定パスの音声ファイルを ffmpeg 経由で再生する。"""
+    audio = discord.FFmpegPCMAudio(
+        path,
+        before_options="-loglevel quiet -nostdin",
+        options="-vn"
+    )
+    vc.play(audio)
+    while vc.is_playing():
+        await asyncio.sleep(0.2)
+
+
+async def _tts_play_gtts(vc: discord.VoiceClient, guild_id: int, text: str, speaker_id: int | None, st: dict):
+    """gTTS を用いた従来の読み上げを実行する。"""
+    prof = _pick_voice_profile_for_user(guild_id, speaker_id)
     final_tempo = st["tts_base_tempo"] * prof.get("tempo", 1.0)
     final_tempo = max(0.5, min(2.5, final_tempo))
     semitones = float(prof.get("semitones", 0.0))
@@ -592,7 +647,6 @@ async def tts_play(guild: discord.Guild, text: str, speaker_id: int | None = Non
     try:
         gTTS(text=sanitize_for_tts(text), lang=TTS_LANG).save(tmp_path)
         af = _build_ffmpeg_afilter(semitones=semitones, final_tempo=final_tempo)
-        # ffmpeg の警告出力を抑制し、CLI へのノイズを防ぐ
         audio = discord.FFmpegPCMAudio(
             tmp_path,
             before_options="-loglevel quiet -nostdin",
@@ -602,8 +656,43 @@ async def tts_play(guild: discord.Guild, text: str, speaker_id: int | None = Non
         while vc.is_playing():
             await asyncio.sleep(0.2)
     finally:
-        try: os.remove(tmp_path)
-        except: pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+async def _tts_play_voicevox(vc: discord.VoiceClient, guild_id: int, text: str, speaker_id: int | None):
+    """VOICEVOX を用いた読み上げを実行する。"""
+    resolved = _resolve_voicevox_speaker(guild_id, speaker_id)
+    sanitized = sanitize_for_tts(text)
+    try:
+        audio_bytes = await _voicevox_synthesize(sanitized, resolved)
+    except Exception:
+        await asyncio.sleep(0.1)
+        return
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        tmp_path = f.name
+        f.write(audio_bytes)
+
+    try:
+        await _play_vc_audio(vc, tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _resolve_voicevox_speaker(guild_id: int, user_id: int | None) -> int:
+    """ユーザー向けの VOICEVOX 話者 ID を決定する。"""
+    st = get_state(guild_id)
+    if user_id is not None:
+        sid = st["tts_speakers"].get(int(user_id))
+        if isinstance(sid, int):
+            return sid
+    return int(st.get("tts_default_speaker", VOICEVOX_DEFAULT_SPEAKER))
 
 
 @bot.event
@@ -804,6 +893,8 @@ async def on_message(message: discord.Message):
 async def ttsspeed(ctx: commands.Context, ratio: str = None):
     if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
         return await ctx.reply("このコマンドはサーバー管理者のみ実行できます。")
+    if TTS_PROVIDER != "gtts":
+        return await ctx.reply("現在の読み上げエンジンでは `ttsspeed` は利用できません (gTTS 専用機能)。")
     if not ratio:
         return await ctx.reply("使い方: `!ttsspeed 1.35`  （推奨: 0.6〜2.0）")
 
@@ -822,6 +913,8 @@ async def ttsspeed(ctx: commands.Context, ratio: str = None):
 async def ttsvoice(ctx: commands.Context, member: discord.Member = None, semitones: str = None, tempo: str = None):
     if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
         return await ctx.reply("このコマンドはサーバー管理者のみ実行できます。")
+    if TTS_PROVIDER != "gtts":
+        return await ctx.reply("現在の読み上げエンジンでは `ttsvoice` は利用できません (gTTS 専用機能)。")
 
     if member is None or semitones is None:
         return await ctx.reply(
@@ -875,7 +968,132 @@ async def ttsconfig(ctx: commands.Context):
             lines.append(f"  • {name}: semitones={ov.get('semitones',0):+.1f}, tempo={ov.get('tempo',1.0):.2f}")
         if len(st["tts_overrides"]) > 10:
             lines.append(f"  …ほか {len(st['tts_overrides']) - 10} 件")
+    lines.append(f"- VOICEVOX デフォルト話者ID: {st['tts_default_speaker']}")
+    if st["tts_speakers"]:
+        lines.append("- VOICEVOX 個別話者（最大10件表示）:")
+        for uid, sid in list(st["tts_speakers"].items())[:10]:
+            m = ctx.guild.get_member(uid)
+            name = m.display_name if m else f"User {uid}"
+            lines.append(f"  • {name}: speaker_id={sid}")
+        if len(st["tts_speakers"]) > 10:
+            lines.append(f"  …ほか {len(st['tts_speakers']) - 10} 件")
     await ctx.reply("\n".join(lines))
+
+
+@bot.command(name="ttsspeaker", aliases=["スピーカー", "speaker"])
+async def ttsspeaker(ctx: commands.Context, *args):
+    """VOICEVOX の話者 ID を管理するコマンド。"""
+    if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+        return await ctx.reply("このコマンドはサーバー管理者のみ実行できます。")
+    if TTS_PROVIDER != "voicevox":
+        return await ctx.reply("現在の読み上げエンジンでは VOICEVOX 話者設定は利用できません。")
+
+    st = get_state(ctx.guild.id)
+
+    if not args:
+        current = st["tts_default_speaker"]
+        count = len(st["tts_speakers"])
+        return await ctx.reply(f"VOICEVOX デフォルト話者IDは {current}、個別設定は {count} 件です。")
+
+    keyword = args[0].lower()
+
+    if keyword == "export":
+        payload = {
+            "default_speaker": st["tts_default_speaker"],
+            "user_speakers": {str(k): v for k, v in st["tts_speakers"].items()},
+        }
+        blob = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        fp = io.BytesIO(blob)
+        fp.seek(0)
+        return await ctx.reply(
+            "VOICEVOX の話者設定ファイルです。",
+            file=discord.File(fp, filename="voicevox_speakers.json"),
+        )
+
+    if keyword == "import":
+        if not ctx.message.attachments:
+            return await ctx.reply("JSON ファイルを添付してください。")
+        try:
+            data = await ctx.message.attachments[0].read()
+            payload = json.loads(data.decode("utf-8"))
+        except Exception as exc:
+            return await ctx.reply(f"JSON の読み込みに失敗しました: {exc!r}")
+
+        if "default_speaker" in payload:
+            try:
+                st["tts_default_speaker"] = int(payload["default_speaker"])
+            except Exception:
+                return await ctx.reply("default_speaker は整数で指定してください。")
+
+        mapping = payload.get("user_speakers", {})
+        new_map: dict[int, int] = {}
+        try:
+            for k, v in mapping.items():
+                new_map[int(k)] = int(v)
+        except Exception:
+            return await ctx.reply("user_speakers 内のキーと値は整数で指定してください。")
+
+        st["tts_speakers"] = new_map
+        return await ctx.reply(f"VOICEVOX 話者設定を {len(new_map)} 件読み込みました。")
+
+    if keyword == "default":
+        if len(args) < 2:
+            return await ctx.reply("`!ttsspeaker default <speaker_id>` の形式で指定してください。")
+        try:
+            sid = int(args[1])
+        except Exception:
+            return await ctx.reply("speaker_id は整数で指定してください。")
+        st["tts_default_speaker"] = sid
+        return await ctx.reply(f"VOICEVOX デフォルト話者IDを {sid} に設定しました。")
+
+    # 個別ユーザー設定
+    member = ctx.message.mentions[0] if ctx.message.mentions else None
+    if member is None:
+        try:
+            uid = int(args[0])
+            member = ctx.guild.get_member(uid)
+            if member is None:
+                member = await ctx.guild.fetch_member(uid)
+        except Exception:
+            member = None
+
+    if member is None:
+        return await ctx.reply("ユーザーを特定できませんでした。メンションまたはユーザーIDで指定してください。")
+
+    if len(args) < 2:
+        current = st["tts_speakers"].get(member.id)
+        return await ctx.reply(f"{member.display_name} の話者IDは {current if current is not None else '未設定'} です。")
+
+    value = args[1].lower()
+    if value in ("reset", "clear"):
+        st["tts_speakers"].pop(member.id, None)
+        return await ctx.reply(f"{member.display_name} の VOICEVOX 話者設定を削除しました。")
+
+    try:
+        sid = int(value)
+    except Exception:
+        return await ctx.reply("speaker_id は整数で指定してください。")
+
+    st["tts_speakers"][member.id] = sid
+    return await ctx.reply(f"{member.display_name} の VOICEVOX 話者IDを {sid} に設定しました。")
+
+
+@bot.command(name="logs", aliases=["ログ取得", "getlogs"])
+async def download_logs(ctx: commands.Context):
+    """音声関連ログ（TTS/STT）を取得して送信する。"""
+    files: list[discord.File] = []
+    async with _log_lock:
+        for path in (TTS_LOG_PATH, STT_LOG_PATH):
+            if path.exists():
+                data = path.read_bytes()
+                buff = io.BytesIO(data)
+                buff.seek(0)
+                files.append(discord.File(buff, filename=path.name))
+
+    if not files:
+        return await ctx.reply("まだログファイルが存在しません。")
+
+    await ctx.reply("最新のログファイルです。", files=files)
 
 @bot.command(name="sttset")
 async def sttset(ctx, key: str=None, value: str=None):
@@ -1293,7 +1511,7 @@ _HELP_ITEMS = [
     {
         "name": "ttsvoice", "aliases": ["声色"],
         "usage": "{p}ttsvoice @ユーザー (<半音> [テンポ] | reset)",
-        "desc": "特定ユーザーの声色（半音）とテンポ係数を上書きします。例: `@太郎 +3 1.10` / `reset`",
+        "desc": "特定ユーザーの声色（半音）とテンポ係数を上書きします（gTTS 利用時のみ）。例: `@太郎 +3 1.10` / `reset`",
         "admin_only": True,
     },
     {
@@ -1301,6 +1519,17 @@ _HELP_ITEMS = [
         "usage": "{p}ttsconfig",
         "desc": "現在の話速・個別声色オーバーライドの一覧を表示します。",
         "admin_only": True,
+    },
+    {
+        "name": "ttsspeaker", "aliases": ["スピーカー", "speaker"],
+        "usage": "{p}ttsspeaker [default/export/import/ユーザー]",
+        "desc": "VOICEVOX のデフォルト話者やユーザー別話者IDを管理します（VOICEVOX 利用時のみ）。",
+        "admin_only": True,
+    },
+    {
+        "name": "logs", "aliases": ["ログ取得", "getlogs"],
+        "usage": "{p}logs",
+        "desc": "TTS/STT のログファイル（CSV）をダウンロードします。",
     },
 ]
 
@@ -1362,8 +1591,8 @@ async def help_command(ctx: commands.Context, *, command_name: str = None):
 
     # 見やすい順に並べ替え（お好みで）
     order = ["join","leave","readon","readoff","readhere","stton","sttoff",
-             "stttest","rectest","diag","whereami","intentcheck","sttset",
-             "ttsspeed","ttsvoice","ttsconfig"]
+             "stttest","rectest","diag","logs","whereami","intentcheck","sttset",
+             "ttsspeed","ttsvoice","ttsconfig","ttsspeaker"]
     sort_key = {name:i for i,name in enumerate(order)}
     visible_items.sort(key=lambda x: sort_key.get(x["name"], 999))
 
