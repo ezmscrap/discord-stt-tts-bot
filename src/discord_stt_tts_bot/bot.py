@@ -647,9 +647,10 @@ async def tts_play(guild: discord.Guild, text: str, speaker_id: int | None = Non
 
     st = get_state(guild.id)
     if TTS_PROVIDER == "voicevox":
-        await _tts_play_voicevox(vc, guild.id, text, speaker_id)
-        return
-
+        fallback = await _tts_play_voicevox(vc, guild, text, speaker_id)
+        if not fallback:
+            return
+        # VOICEVOX が失敗した場合は fallback により gTTS 呼び出しへ
     await _tts_play_gtts(vc, guild.id, text, speaker_id, st)
 
 
@@ -692,15 +693,19 @@ async def _tts_play_gtts(vc: discord.VoiceClient, guild_id: int, text: str, spea
             pass
 
 
-async def _tts_play_voicevox(vc: discord.VoiceClient, guild_id: int, text: str, speaker_id: int | None):
-    """VOICEVOX を用いた読み上げを実行する。"""
-    resolved = _resolve_voicevox_speaker(guild_id, speaker_id)
+async def _tts_play_voicevox(vc: discord.VoiceClient, guild: discord.Guild, text: str, speaker_id: int | None) -> bool:
+    """VOICEVOX を用いた読み上げを実行する。成功したら True、失敗した場合は False を返す。"""
+    resolved = _resolve_voicevox_speaker(guild.id, speaker_id)
     sanitized = sanitize_for_tts(text)
     try:
         audio_bytes = await _voicevox_synthesize(sanitized, resolved)
-    except Exception:
-        await asyncio.sleep(0.1)
-        return
+    except Exception as exc:
+        print("[TTS] VOICEVOX fallback to gTTS due to:", repr(exc))
+        try:
+            await _notify_voicevox_failure(guild, resolved)
+        except Exception as notify_exc:
+            print("[TTS] Failed to notify VOICEVOX fallback:", repr(notify_exc))
+        return True  # fallback: gTTS を続ける
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         tmp_path = f.name
@@ -708,6 +713,7 @@ async def _tts_play_voicevox(vc: discord.VoiceClient, guild_id: int, text: str, 
 
     try:
         await _play_vc_audio(vc, tmp_path)
+        return False
     finally:
         try:
             os.remove(tmp_path)
@@ -723,6 +729,24 @@ def _resolve_voicevox_speaker(guild_id: int, user_id: int | None) -> int:
         if isinstance(sid, int):
             return sid
     return int(st.get("tts_default_speaker", VOICEVOX_DEFAULT_SPEAKER))
+
+
+async def _notify_voicevox_failure(guild: discord.Guild, speaker_id: int):
+    """VOICEVOX 失敗時に読み上げ対象チャンネルへ通知する。"""
+    st = get_state(guild.id)
+    channel_id = st.get("read_channel_id")
+    channel: T.Optional[discord.abc.Messageable] = None
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+    if channel is None:
+        channel = _pick_fallback_text_channel(guild)
+    if channel is None:
+        return
+    note = (
+        "🔄 VOICEVOX への接続に失敗したため、読み上げを gTTS に切り替えました。\n"
+        f"speaker_id={speaker_id}"
+    )
+    await channel.send(note)
 
 
 @bot.event
@@ -1013,8 +1037,6 @@ async def ttsconfig(ctx: commands.Context):
 @bot.command(name="ttsspeaker", aliases=["スピーカー", "speaker"])
 async def ttsspeaker(ctx: commands.Context, *args):
     """VOICEVOX の話者 ID を管理するコマンド。"""
-    if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
-        return await ctx.reply("このコマンドはサーバー管理者のみ実行できます。")
     if TTS_PROVIDER != "voicevox":
         return await ctx.reply("現在の読み上げエンジンでは VOICEVOX 話者設定は利用できません。")
 
@@ -1028,6 +1050,8 @@ async def ttsspeaker(ctx: commands.Context, *args):
     keyword = args[0].lower()
 
     if keyword == "export":
+        if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+            return await ctx.reply("この操作はサーバー管理者のみ実行できます。")
         payload = {
             "default_speaker": st["tts_default_speaker"],
             "user_speakers": {str(k): v for k, v in st["tts_speakers"].items()},
@@ -1041,6 +1065,8 @@ async def ttsspeaker(ctx: commands.Context, *args):
         )
 
     if keyword == "import":
+        if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+            return await ctx.reply("この操作はサーバー管理者のみ実行できます。")
         if not ctx.message.attachments:
             return await ctx.reply("JSON ファイルを添付してください。")
         try:
@@ -1067,6 +1093,8 @@ async def ttsspeaker(ctx: commands.Context, *args):
         return await ctx.reply(f"VOICEVOX 話者設定を {len(new_map)} 件読み込みました。")
 
     if keyword == "default":
+        if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+            return await ctx.reply("この操作はサーバー管理者のみ実行できます。")
         if len(args) < 2:
             return await ctx.reply("`!ttsspeaker default <speaker_id>` の形式で指定してください。")
         try:
@@ -1086,6 +1114,9 @@ async def ttsspeaker(ctx: commands.Context, *args):
                 member = await ctx.guild.fetch_member(uid)
         except Exception:
             member = None
+    if member is None or (member != ctx.author and not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator)):
+        # 管理権限が無い場合は自身のみ設定可能
+        member = ctx.author
 
     if member is None:
         return await ctx.reply("ユーザーを特定できませんでした。メンションまたはユーザーIDで指定してください。")
@@ -1105,14 +1136,14 @@ async def ttsspeaker(ctx: commands.Context, *args):
         return await ctx.reply("speaker_id は整数で指定してください。")
 
     st["tts_speakers"][member.id] = sid
+    if member == ctx.author:
+        return await ctx.reply(f"あなたの VOICEVOX 話者IDを {sid} に設定しました。")
     return await ctx.reply(f"{member.display_name} の VOICEVOX 話者IDを {sid} に設定しました。")
 
 
 @bot.command(name="sttcolor", aliases=["字幕色", "color"])
 async def sttcolor(ctx: commands.Context, *args):
     """字幕カラー設定を管理する。"""
-    if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
-        return await ctx.reply("このコマンドはサーバー管理者のみ実行できます。")
 
     st = get_state(ctx.guild.id)
 
@@ -1130,6 +1161,8 @@ async def sttcolor(ctx: commands.Context, *args):
     keyword = args[0].lower()
 
     if keyword == "export":
+        if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+            return await ctx.reply("この操作はサーバー管理者のみ実行できます。")
         payload = {
             "user_colors": {str(k): v for k, v in st["stt_color_overrides"].items()}
         }
@@ -1142,6 +1175,8 @@ async def sttcolor(ctx: commands.Context, *args):
         )
 
     if keyword == "import":
+        if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+            return await ctx.reply("この操作はサーバー管理者のみ実行できます。")
         if not ctx.message.attachments:
             return await ctx.reply("JSON ファイルを添付してください。")
         try:
@@ -1174,6 +1209,8 @@ async def sttcolor(ctx: commands.Context, *args):
                 member = await ctx.guild.fetch_member(uid)
         except Exception:
             member = None
+    if member is None or (member != ctx.author and not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator)):
+        member = ctx.author
 
     if member is None:
         return await ctx.reply("ユーザーを特定できませんでした。メンションまたはユーザーIDで指定してください。")
@@ -1198,6 +1235,8 @@ async def sttcolor(ctx: commands.Context, *args):
         return await ctx.reply("カラー番号は 0-15 の範囲で指定してください。")
 
     st["stt_color_overrides"][member.id] = idx
+    if member == ctx.author:
+        return await ctx.reply(f"あなたの字幕カラーを {idx} に設定しました。")
     return await ctx.reply(f"{member.display_name} の字幕カラーを {idx} に設定しました。")
 
 
