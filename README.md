@@ -52,6 +52,7 @@ VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:5
 ## 音声合成エンジンの切り替え
 - `TTS_PROVIDER=gtts` … 既定の gTTS を使用し、`!ttsspeed` や `!ttsvoice` で話速・声色を調整します。
 - `TTS_PROVIDER=voicevox` … `.env` の `VOICEVOX_BASE_URL` で指定した VOICEVOX エンジンを利用します。ユーザーごとの話者IDは `!ttsspeaker` コマンドでエクスポート／インポート・個別設定が可能です。
+- VOICEVOX のスタイル一覧は `!voicevoxstyles` で確認でき、字幕カラーのパレットは `!sttpalette` で参照できます。
 
 ## ライセンス
 MIT License

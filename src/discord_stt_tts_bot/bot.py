@@ -1240,6 +1240,53 @@ async def sttcolor(ctx: commands.Context, *args):
     return await ctx.reply(f"{member.display_name} の字幕カラーを {idx} に設定しました。")
 
 
+@bot.command(name="voicevoxstyles", aliases=["voxstyles", "voxlist"])
+async def voicevoxstyles(ctx: commands.Context):
+    """VOICEVOX の話者IDとスタイル一覧を表示する。"""
+    if TTS_PROVIDER != "voicevox":
+        return await ctx.reply("現在の読み上げエンジンは VOICEVOX ではありません。")
+    try:
+        resp = requests.get(f"{VOICEVOX_BASE_URL}/speakers", timeout=VOICEVOX_TIMEOUT)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        return await ctx.reply(f"VOICEVOX のスタイル取得に失敗しました: {exc!r}")
+
+    lines: list[str] = []
+    for speaker in payload or []:
+        base_name = speaker.get("name", "unknown")
+        for style in speaker.get("styles", []):
+            sid = style.get("id")
+            style_name = style.get("name", "default")
+            if sid is None:
+                continue
+            lines.append(f"{sid:>4}: {base_name} / {style_name}")
+
+    if not lines:
+        return await ctx.reply("スタイル情報が取得できませんでした。")
+
+    chunk = []
+    header = "VOICEVOX 話者IDとスタイル一覧"
+    for line in lines:
+        chunk.append(line)
+        if len("\n".join(chunk)) > 1700:
+            text = "\n".join(chunk[:-1])
+            await ctx.reply(f"{header}\n```\n{text}\n```")
+            header = ""
+            chunk = [chunk[-1]]
+    if chunk:
+        text = "\n".join(chunk)
+        await ctx.reply((f"{header}\n" if header else "") + f"```\n{text}\n```")
+
+
+@bot.command(name="sttpalette", aliases=["colorpalette", "palette"])
+async def sttpalette(ctx: commands.Context):
+    """字幕カラーのパレット番号とカラーコードを表示する。"""
+    lines = [f"{idx:>2}: #{color:06X}" for idx, color in enumerate(STT_COLOR_PALETTE)]
+    text = "\n".join(lines)
+    await ctx.reply("字幕カラー パレット一覧\n" + f"```\n{text}\n```")
+
+
 @bot.command(name="logs", aliases=["ログ取得", "getlogs"])
 async def download_logs(ctx: commands.Context):
     """音声関連ログ（TTS/STT）を取得して送信する。"""
@@ -1667,7 +1714,16 @@ _HELP_ITEMS = [
         "name": "sttcolor", "aliases": ["字幕色", "color"],
         "usage": "{p}sttcolor [export/import/ユーザー]",
         "desc": "字幕の色を管理します。0-15 のパレット指定や設定ファイルの入出力に対応します。",
-        "admin_only": True,
+    },
+    {
+        "name": "voicevoxstyles", "aliases": ["voxstyles", "voxlist"],
+        "usage": "{p}voicevoxstyles",
+        "desc": "VOICEVOX の話者IDとスタイル名の一覧を表示します。",
+    },
+    {
+        "name": "sttpalette", "aliases": ["colorpalette", "palette"],
+        "usage": "{p}sttpalette",
+        "desc": "字幕カラーのパレット番号とカラーコードを確認します。",
     },
     # ==== 管理者向け（表示制御） ====
     {
@@ -1760,7 +1816,7 @@ async def help_command(ctx: commands.Context, *, command_name: str = None):
     # 見やすい順に並べ替え（お好みで）
     order = ["join","leave","readon","readoff","readhere","stton","sttoff",
              "stttest","rectest","diag","logs","whereami","intentcheck","sttset",
-             "sttcolor","ttsspeed","ttsvoice","ttsconfig","ttsspeaker"]
+             "sttcolor","sttpalette","voicevoxstyles","ttsspeed","ttsvoice","ttsconfig","ttsspeaker"]
     sort_key = {name:i for i,name in enumerate(order)}
     visible_items.sort(key=lambda x: sort_key.get(x["name"], 999))
 
