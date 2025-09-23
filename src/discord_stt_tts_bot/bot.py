@@ -761,10 +761,36 @@ async def join(ctx: commands.Context):
         return await ctx.reply("先にボイスチャンネルへ入室してください。")
     channel = ctx.author.voice.channel
     vc = ctx.guild.voice_client
-    if vc and vc.is_connected():
-        await vc.move_to(channel)
-    else:
+
+    if vc and vc.channel and vc.channel.id == channel.id:
+        return await ctx.reply(f"既に **{channel.name}** に接続済みです。")
+
+    if vc:
+        try:
+            await ensure_stopped(vc, "before rejoin")
+        except Exception:
+            pass
+        try:
+            await vc.disconnect(force=True)
+        except Exception as exc:
+            print("[join] disconnect failed:", repr(exc))
+
+    try:
         vc = await channel.connect()
+    except discord.ClientException as exc:
+        if "Already connected" in str(exc):
+            existing = ctx.guild.voice_client
+            if existing:
+                try:
+                    await existing.move_to(channel)
+                    vc = existing
+                except Exception as move_exc:
+                    print("[join] move_to after Already connected failed:", repr(move_exc))
+                    raise
+            else:
+                raise
+        else:
+            raise
 
     # 🔧 Stage だったら話者化を試みる（失敗しても続行）
     if isinstance(channel, StageChannel):
