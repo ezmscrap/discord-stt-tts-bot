@@ -130,6 +130,7 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 - `!sttcolor ...` … 字幕カラーを管理（`export` / `import` / `@ユーザー <0-15>` 等）
 - `!voicevoxstyles` … VOICEVOX の話者IDとスタイル名を一覧表示
 - `!sttpalette` … 字幕カラーのパレット番号とカラーコードを表示
+- `!voxdict <export|import|add>` … VOICEVOX のユーザー辞書を管理
 
 > 読み上げを gTTS で行う場合は、FFmpeg フィルタでピッチ（半音）と話速を調整しています。既定で話者ごとに声色が変わるよう自動割り当てされます（ユーザーIDベース）。
 > VOICEVOX を選択した場合は、`.env` で `TTS_PROVIDER=voicevox` を設定し、`VOICEVOX_BASE_URL`/`VOICEVOX_DEFAULT_SPEAKER` と `!ttsspeaker` コマンドを組み合わせて管理します。
@@ -142,6 +143,7 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 - `!whereami` … 現在のチャンネル情報
 - `!intentcheck` … intents の動作確認
 - `!help [コマンド名]` … コマンドヘルプを表示
+- `!voxdict` … VOICEVOX 辞書操作のショートヘルプ
 
 ---
 

@@ -749,6 +749,97 @@ async def _notify_voicevox_failure(guild: discord.Guild, speaker_id: int):
     await channel.send(note)
 
 
+async def _voicevox_fetch_json(method: str, path: str, *, params=None, json_payload=None):
+    """VOICEVOX との同期HTTP通信をスレッドで行うヘルパー。"""
+    if TTS_PROVIDER != "voicevox":
+        raise RuntimeError("VOICEVOX provider is disabled")
+
+    def _request():
+        url = f"{VOICEVOX_BASE_URL}{path}"
+        resp = requests.request(method, url, params=params, json=json_payload, timeout=VOICEVOX_TIMEOUT)
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            detail = None
+            try:
+                detail_json = resp.json()
+                detail = json.dumps(detail_json, ensure_ascii=False)
+            except Exception:
+                detail = resp.text
+            msg = f"HTTP {resp.status_code}: {detail or str(exc)}"
+            raise requests.HTTPError(msg, response=resp) from exc
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _request)
+
+
+async def _voicevox_list_dictionary() -> list[dict]:
+    data = await _voicevox_fetch_json("GET", "/user_dict")
+    items = []
+    if isinstance(data, dict):
+        items = [{"id": key, **value} for key, value in data.items()]
+    elif isinstance(data, list):
+        items = data
+    items.sort(key=lambda x: (x.get("pronunciation") or "", x.get("surface") or ""))
+    return items
+
+
+async def _voicevox_add_dictionary_word(surface: str, pronunciation: str, accent_type: int | None = None, word_type: str = "PROPER_NOUN"):
+    surface = (surface or "").strip()
+    pronunciation = _normalize_pronunciation(pronunciation)
+    accent = _sanitize_accent_type(pronunciation, accent_type)
+    payload = {
+        "surface": surface,
+        "pronunciation": pronunciation,
+        "word_type": word_type or "PROPER_NOUN",
+        "accent_type": accent,
+    }
+    try:
+        return await _voicevox_fetch_json("POST", "/user_dict_word", params=payload)
+    except requests.HTTPError as exc:
+        resp = getattr(exc, "response", None)
+        detail = resp.text if resp is not None else str(exc)
+        raise RuntimeError(f"VOICEVOX 辞書登録に失敗しました: {detail}") from exc
+
+
+def _sanitize_accent_type(pronunciation: str, accent_type: int | str | None) -> int:
+    try:
+        accent = int(accent_type) if accent_type is not None else 1
+    except (TypeError, ValueError):
+        accent = 1
+
+    accent = max(0, accent)
+    pron = (pronunciation or "").strip()
+    if not pron:
+        return accent
+
+    max_len = max(1, len(pron))
+    if accent > max_len:
+        accent = max_len
+    return accent
+
+
+_HIRA_TO_KATA = str.maketrans({
+    **{chr(h): chr(h + 0x60) for h in range(0x3041, 0x3097)},
+    "ゔ": "ヴ",
+    "ゐ": "ヰ",
+    "ゑ": "ヱ",
+})
+
+
+def _normalize_pronunciation(src: str | None) -> str:
+    pron = (src or "").strip()
+    if not pron:
+        return ""
+    pron = pron.translate(_HIRA_TO_KATA)
+    pron = pron.replace("　", " ").replace(" ", "")
+    return pron
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (py-cord)")
@@ -1308,9 +1399,114 @@ async def voicevoxstyles(ctx: commands.Context):
 @bot.command(name="sttpalette", aliases=["colorpalette", "palette"])
 async def sttpalette(ctx: commands.Context):
     """字幕カラーのパレット番号とカラーコードを表示する。"""
-    lines = [f"{idx:>2}: #{color:06X}" for idx, color in enumerate(STT_COLOR_PALETTE)]
-    text = "\n".join(lines)
-    await ctx.reply("字幕カラー パレット一覧\n" + f"```\n{text}\n```")
+    embeds: list[discord.Embed] = []
+    for idx, color in enumerate(STT_COLOR_PALETTE):
+        embed = discord.Embed(
+            title=f"パレット {idx}",
+            description=f"カラーコード: `#{color:06X}`\nこの色で字幕を設定するには `!sttcolor @ユーザー {idx}`" ,
+            color=color,
+        )
+        embed.set_footer(text="字幕カラーのプレビューです。サイドバーが該当色になります。")
+        embeds.append(embed)
+
+    if not embeds:
+        return await ctx.reply("パレットが見つかりませんでした。")
+
+    for i in range(0, len(embeds), 10):
+        await ctx.reply(embeds=embeds[i:i+10])
+
+
+@bot.command(name="voxdict", aliases=["辞書管理"])
+async def voxdict(ctx: commands.Context, action: str | None = None, *args):
+    """VOICEVOX のユーザー辞書を管理する。"""
+    if TTS_PROVIDER != "voicevox":
+        return await ctx.reply("現在の読み上げエンジンでは VOICEVOX 辞書を管理できません。")
+
+    is_admin = ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator
+
+    if not action:
+        return await ctx.reply(
+            "使い方: `!voxdict export` / `!voxdict import` (JSON添付) / "
+            "`!voxdict add <表層形> <発音> [アクセント番号]`"
+        )
+
+    key = action.lower()
+
+    if key == "export":
+        if not is_admin:
+            return await ctx.reply("辞書のエクスポートはサーバー管理者のみ実行できます。")
+        try:
+            items = await _voicevox_list_dictionary()
+        except Exception as exc:
+            return await ctx.reply(f"辞書取得に失敗しました: {exc!r}")
+
+        payload = [
+            {
+                "surface": item.get("surface"),
+                "pronunciation": item.get("pronunciation"),
+                "accent_type": item.get("accent_type"),
+                "word_type": item.get("word_type"),
+            }
+            for item in items
+        ]
+        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        fp = io.BytesIO(data)
+        fp.seek(0)
+        return await ctx.reply("VOICEVOX 辞書ファイルです。", file=discord.File(fp, filename="voicevox_dictionary.json"))
+
+    if key == "import":
+        if not is_admin:
+            return await ctx.reply("辞書のインポートはサーバー管理者のみ実行できます。")
+        if not ctx.message.attachments:
+            return await ctx.reply("辞書JSONファイルを添付してください。")
+        try:
+            blob = await ctx.message.attachments[0].read()
+            entries = json.loads(blob.decode("utf-8"))
+        except Exception as exc:
+            return await ctx.reply(f"JSON の読み込みに失敗しました: {exc!r}")
+
+        added = 0
+        errors = 0
+        last_error = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            surface = entry.get("surface")
+            pron = entry.get("pronunciation")
+            accent = entry.get("accent_type")
+            wtype = entry.get("word_type", "PROPER_NOUN")
+            if not surface or not pron:
+                continue
+            try:
+                await _voicevox_add_dictionary_word(surface, pron, accent, wtype)
+                added += 1
+            except Exception as exc:
+                errors += 1
+                last_error = str(exc)
+                print("[VOICEVOX] import error:", repr(exc))
+        message = f"辞書をインポートしました。追加 {added} 件 / 失敗 {errors} 件。"
+        if last_error:
+            message += f"\n直近のエラー: {last_error}"
+        return await ctx.reply(message)
+
+    if key == "add":
+        if len(args) < 2:
+            return await ctx.reply("`!voxdict add <表層形> <発音> [アクセント番号]` の形式で指定してください。")
+        surface = args[0]
+        pronunciation = args[1]
+        accent = None
+        if len(args) >= 3:
+            try:
+                accent = int(args[2])
+            except Exception:
+                return await ctx.reply("アクセント番号は整数で指定してください。")
+        try:
+            await _voicevox_add_dictionary_word(surface, pronunciation, accent)
+            return await ctx.reply(f"辞書に `{surface}` ({pronunciation}) を追加しました。")
+        except Exception as exc:
+            return await ctx.reply(f"辞書への追加に失敗しました: {exc!r}")
+
+    return await ctx.reply("未知の操作です。`export` / `import` / `add` を指定してください。")
 
 
 @bot.command(name="logs", aliases=["ログ取得", "getlogs"])
@@ -1751,6 +1947,11 @@ _HELP_ITEMS = [
         "usage": "{p}sttpalette",
         "desc": "字幕カラーのパレット番号とカラーコードを確認します。",
     },
+    {
+        "name": "voxdict", "aliases": ["辞書管理"],
+        "usage": "{p}voxdict <export|import|add>",
+        "desc": "VOICEVOX のユーザー辞書をエクスポート/インポート/追加します。",
+    },
     # ==== 管理者向け（表示制御） ====
     {
         "name": "ttsspeed", "aliases": ["読み上げ速度"],
@@ -1842,7 +2043,7 @@ async def help_command(ctx: commands.Context, *, command_name: str = None):
     # 見やすい順に並べ替え（お好みで）
     order = ["join","leave","readon","readoff","readhere","stton","sttoff",
              "stttest","rectest","diag","logs","whereami","intentcheck","sttset",
-             "sttcolor","sttpalette","voicevoxstyles","ttsspeed","ttsvoice","ttsconfig","ttsspeaker"]
+             "sttcolor","sttpalette","voicevoxstyles","voxdict","ttsspeed","ttsvoice","ttsconfig","ttsspeaker"]
     sort_key = {name:i for i,name in enumerate(order)}
     visible_items.sort(key=lambda x: sort_key.get(x["name"], 999))
 

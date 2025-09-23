@@ -47,12 +47,13 @@ Discord のボイスチャンネルで **テキスト読み上げ (TTS)** と **
    python -m discord_stt_tts_bot
    ```
 
-VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:50021`）や `VOICEVOX_DEFAULT_SPEAKER` を `.env` で設定してください。FFmpeg が未導入の場合は別途インストールし、`ffmpeg -version` で利用可能か確認してください。字幕カラーは16色パレットから自動割り当てされ、`!sttcolor` コマンドでユーザー単位に上書きできます。詳細なセットアップやコマンド一覧は `docs/usage.md` を参照してください。
+VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:50021`）や `VOICEVOX_DEFAULT_SPEAKER` を `.env` で設定してください。FFmpeg が未導入の場合は別途インストールし、`ffmpeg -version` で利用可能か確認してください。字幕カラーは16色パレットから自動割り当てされ、`!sttcolor` コマンドでユーザー単位に上書きできます。`!voicevoxstyles` で話者IDとスタイル名を確認し、`!voxdict` で VOICEVOX のユーザー辞書を管理できます。詳細なセットアップやコマンド一覧は `docs/usage.md` を参照してください。
 
 ## 音声合成エンジンの切り替え
 - `TTS_PROVIDER=gtts` … 既定の gTTS を使用し、`!ttsspeed` や `!ttsvoice` で話速・声色を調整します。
 - `TTS_PROVIDER=voicevox` … `.env` の `VOICEVOX_BASE_URL` で指定した VOICEVOX エンジンを利用します。ユーザーごとの話者IDは `!ttsspeaker` コマンドでエクスポート／インポート・個別設定が可能です。
 - VOICEVOX のスタイル一覧は `!voicevoxstyles` で確認でき、字幕カラーのパレットは `!sttpalette` で参照できます。
+- VOICEVOX のユーザー辞書は `!voxdict export/import/add` で管理できます。
 
 ## ライセンス
 MIT License
