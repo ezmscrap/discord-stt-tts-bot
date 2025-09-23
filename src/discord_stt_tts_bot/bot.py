@@ -34,6 +34,14 @@ VOICEVOX_BASE_URL = (os.getenv("VOICEVOX_BASE_URL", "http://127.0.0.1:50021").st
 VOICEVOX_TIMEOUT = float(os.getenv("VOICEVOX_TIMEOUT", "15"))
 VOICEVOX_DEFAULT_SPEAKER = int(os.getenv("VOICEVOX_DEFAULT_SPEAKER", "2"))
 
+# STT字幕用の基本16色（視認性の高い色を選択）
+STT_COLOR_PALETTE: list[int] = [
+    0xF44336, 0xE91E63, 0x9C27B0, 0x673AB7,
+    0x3F51B5, 0x2196F3, 0x03A9F4, 0x00BCD4,
+    0x009688, 0x4CAF50, 0x8BC34A, 0xCDDC39,
+    0xFFC107, 0xFF9800, 0xFF5722, 0x795548,
+]
+
 def _resolve_log_dir(base_dir: Path, env_value: str | None) -> Path:
     # 空 or 未設定 → デフォルト "logs"
     if not env_value or not env_value.strip():
@@ -203,23 +211,25 @@ async def post_caption(guild_id: int, channel, user_id: int, username: str, new_
 
     ch_map = st["last_msgs"].setdefault(ch_id, {})
     entry = ch_map.get(key_u)
+    color = _resolve_caption_color(guild_id, user_id)
 
     # 直近メッセージがあって merge_window 内なら編集で追記
     if entry and entry.get("message") and (now - entry.get("ts", 0)) < st["merge_window"]:
         try:
-            base = entry["message"].content
-            # 先頭の「🎤 **名前**: 」を保ったまま後ろに文章を足す
-            # baseが空でない前提で半角スペース区切り
-            merged = (base + " " + new_text).strip()
-            await entry["message"].edit(content=merged)
+            base_text = entry.get("text", "")
+            merged = (base_text + " " + new_text).strip()
+            embed = _build_caption_embed(username, merged, color)
+            await entry["message"].edit(embed=embed)
+            entry["text"] = merged
             entry["ts"] = now
             return
         except Exception as e:
             print("[STT] edit failed; fallback send:", repr(e))
 
     # 新規投稿
-    m = await channel.send(f"🎤 **{username}**: {new_text}")
-    ch_map[key_u] = {"message": m, "ts": now}
+    embed = _build_caption_embed(username, new_text, color)
+    m = await channel.send(embed=embed)
+    ch_map[key_u] = {"message": m, "ts": now, "text": new_text}
 
 async def resolve_display_name(guild: discord.Guild, user_id: int, data=None) -> str:
     # 1) Sink が user を持っていれば最優先
@@ -554,6 +564,7 @@ def get_state(guild_id):
             tts_overrides={},   # { user_id: {"semitones": float, "tempo": float} }
             tts_default_speaker=VOICEVOX_DEFAULT_SPEAKER,
             tts_speakers={},    # { user_id: speaker_id }
+            stt_color_overrides={},  # { user_id: palette_index }
         )
     return guild_state[guild_id]
 
@@ -580,6 +591,25 @@ def sanitize_for_tts(text: str) -> str:
     text = re.sub(r"<#\d+>", "チャンネル", text)
     text = re.sub(r"https?://\S+", "リンク", text)
     return text[:400]
+
+
+def _resolve_caption_color(guild_id: int, user_id: int | None) -> int:
+    """字幕用のEmbedカラーを決定する。"""
+    st = get_state(guild_id)
+    if user_id is not None:
+        override = st["stt_color_overrides"].get(int(user_id))
+        if isinstance(override, int) and 0 <= override < len(STT_COLOR_PALETTE):
+            return STT_COLOR_PALETTE[override]
+        idx = abs(int(user_id)) % len(STT_COLOR_PALETTE)
+        return STT_COLOR_PALETTE[idx]
+    return STT_COLOR_PALETTE[0]
+
+
+def _build_caption_embed(username: str, text: str, color: int) -> discord.Embed:
+    """字幕表示用のEmbedを生成する。"""
+    embed = discord.Embed(description=text, color=color)
+    embed.set_author(name=username)
+    return embed
 
 
 def _voicevox_request(text: str, speaker_id: int) -> bytes:
@@ -1078,6 +1108,99 @@ async def ttsspeaker(ctx: commands.Context, *args):
     return await ctx.reply(f"{member.display_name} の VOICEVOX 話者IDを {sid} に設定しました。")
 
 
+@bot.command(name="sttcolor", aliases=["字幕色", "color"])
+async def sttcolor(ctx: commands.Context, *args):
+    """字幕カラー設定を管理する。"""
+    if not (ctx.author.guild_permissions.manage_guild or ctx.author.guild_permissions.administrator):
+        return await ctx.reply("このコマンドはサーバー管理者のみ実行できます。")
+
+    st = get_state(ctx.guild.id)
+
+    if not args:
+        count = len(st["stt_color_overrides"])
+        example = ", ".join(
+            f"{idx}:{hex(color)[2:]}" for idx, color in enumerate(STT_COLOR_PALETTE)
+        )
+        return await ctx.reply(
+            "字幕カラー設定の概要です。\n"
+            f"- 個別設定数: {count} 件\n"
+            f"- カラーパレット (0-15): {example}"
+        )
+
+    keyword = args[0].lower()
+
+    if keyword == "export":
+        payload = {
+            "user_colors": {str(k): v for k, v in st["stt_color_overrides"].items()}
+        }
+        blob = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        fp = io.BytesIO(blob)
+        fp.seek(0)
+        return await ctx.reply(
+            "字幕カラー設定ファイルです。",
+            file=discord.File(fp, filename="stt_colors.json"),
+        )
+
+    if keyword == "import":
+        if not ctx.message.attachments:
+            return await ctx.reply("JSON ファイルを添付してください。")
+        try:
+            data = await ctx.message.attachments[0].read()
+            payload = json.loads(data.decode("utf-8"))
+        except Exception as exc:
+            return await ctx.reply(f"JSON の読み込みに失敗しました: {exc!r}")
+
+        mapping = payload.get("user_colors", {})
+        new_map: dict[int, int] = {}
+        try:
+            for k, v in mapping.items():
+                idx = int(v)
+                if 0 <= idx < len(STT_COLOR_PALETTE):
+                    new_map[int(k)] = idx
+                else:
+                    return await ctx.reply("color index は 0-15 の範囲で指定してください。")
+        except Exception:
+            return await ctx.reply("user_colors 内のキーと値は整数で指定してください。")
+
+        st["stt_color_overrides"] = new_map
+        return await ctx.reply(f"字幕カラー設定を {len(new_map)} 件読み込みました。")
+
+    member = ctx.message.mentions[0] if ctx.message.mentions else None
+    if member is None:
+        try:
+            uid = int(args[0])
+            member = ctx.guild.get_member(uid)
+            if member is None:
+                member = await ctx.guild.fetch_member(uid)
+        except Exception:
+            member = None
+
+    if member is None:
+        return await ctx.reply("ユーザーを特定できませんでした。メンションまたはユーザーIDで指定してください。")
+
+    if len(args) < 2:
+        current = st["stt_color_overrides"].get(member.id)
+        return await ctx.reply(
+            f"{member.display_name} の字幕カラーは {current if current is not None else '自動割り当て'} です。"
+        )
+
+    value = args[1].lower()
+    if value in ("reset", "clear"):
+        st["stt_color_overrides"].pop(member.id, None)
+        return await ctx.reply(f"{member.display_name} の字幕カラー設定を削除しました。")
+
+    try:
+        idx = int(value)
+    except Exception:
+        return await ctx.reply("カラー番号は 0-15 の整数で指定してください。")
+
+    if not (0 <= idx < len(STT_COLOR_PALETTE)):
+        return await ctx.reply("カラー番号は 0-15 の範囲で指定してください。")
+
+    st["stt_color_overrides"][member.id] = idx
+    return await ctx.reply(f"{member.display_name} の字幕カラーを {idx} に設定しました。")
+
+
 @bot.command(name="logs", aliases=["ログ取得", "getlogs"])
 async def download_logs(ctx: commands.Context):
     """音声関連ログ（TTS/STT）を取得して送信する。"""
@@ -1501,6 +1624,12 @@ _HELP_ITEMS = [
             " 例: `{p}sttset vad 0.008`, `{p}sttset lang auto`, `{p}sttset thread on`"
         ),
     },
+    {
+        "name": "sttcolor", "aliases": ["字幕色", "color"],
+        "usage": "{p}sttcolor [export/import/ユーザー]",
+        "desc": "字幕の色を管理します。0-15 のパレット指定や設定ファイルの入出力に対応します。",
+        "admin_only": True,
+    },
     # ==== 管理者向け（表示制御） ====
     {
         "name": "ttsspeed", "aliases": ["読み上げ速度"],
@@ -1592,7 +1721,7 @@ async def help_command(ctx: commands.Context, *, command_name: str = None):
     # 見やすい順に並べ替え（お好みで）
     order = ["join","leave","readon","readoff","readhere","stton","sttoff",
              "stttest","rectest","diag","logs","whereami","intentcheck","sttset",
-             "ttsspeed","ttsvoice","ttsconfig","ttsspeaker"]
+             "sttcolor","ttsspeed","ttsvoice","ttsconfig","ttsspeaker"]
     sort_key = {name:i for i,name in enumerate(order)}
     visible_items.sort(key=lambda x: sort_key.get(x["name"], 999))
 

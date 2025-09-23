@@ -6,6 +6,7 @@ Discord のボイスチャンネルで **テキスト読み上げ (TTS)** と **
 - テキストチャンネルの投稿を gTTS + FFmpeg でリアルタイム読み上げ
 - VOICEVOX サーバーを指定した読み上げにも対応（ユーザーごとの話者ID設定をサポート）
 - ボイスチャンネルの音声を録音し、Whisper API で文字起こしして投稿
+- 音声認識結果をユーザーごとに色分けしてEmbed表示（16色パレット／個別指定可）
 - Stage チャンネル対応、字幕用スレッドの自動運用
 - 読み上げ速度や声色プロファイルのカスタマイズ
 
@@ -46,7 +47,7 @@ Discord のボイスチャンネルで **テキスト読み上げ (TTS)** と **
    python -m discord_stt_tts_bot
    ```
 
-VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:50021`）や `VOICEVOX_DEFAULT_SPEAKER` を `.env` で設定してください。FFmpeg が未導入の場合は別途インストールし、`ffmpeg -version` で利用可能か確認してください。詳細なセットアップやコマンド一覧は `docs/usage.md` を参照してください。
+VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:50021`）や `VOICEVOX_DEFAULT_SPEAKER` を `.env` で設定してください。FFmpeg が未導入の場合は別途インストールし、`ffmpeg -version` で利用可能か確認してください。字幕カラーは16色パレットから自動割り当てされ、`!sttcolor` コマンドでユーザー単位に上書きできます。詳細なセットアップやコマンド一覧は `docs/usage.md` を参照してください。
 
 ## 音声合成エンジンの切り替え
 - `TTS_PROVIDER=gtts` … 既定の gTTS を使用し、`!ttsspeed` や `!ttsvoice` で話速・声色を調整します。
