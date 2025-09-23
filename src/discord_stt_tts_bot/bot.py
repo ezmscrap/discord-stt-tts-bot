@@ -1864,62 +1864,62 @@ _HELP_ITEMS = [
     {
         "name": "join", "aliases": ["執事参加","執事入室","執事召喚"],
         "usage": "{p}join",
-        "desc": "今いるボイスチャンネルへボットを参加させます（Stage では話者化を試みます）。",
+        "desc": "今いるボイスチャンネルへボットを参加させます（Stage では話者化を試みます）。例: `{p}join`",
     },
     {
         "name": "leave", "aliases": ["執事退出","執事離脱"],
         "usage": "{p}leave",
-        "desc": "ボイスチャンネルから退出します。",
+        "desc": "ボイスチャンネルから退出します。例: `{p}leave`",
     },
     {
         "name": "readon", "aliases": ["読み上げコマンド","読み上げ","読み上げ開始","読み上げオン","このチャンネルを読み上げ"],
         "usage": "{p}readon",
-        "desc": "このテキストチャンネルの新規メッセージをボイスチャンネルで読み上げます。",
+        "desc": "このテキストチャンネルの新規メッセージをボイスチャンネルで読み上げます。例: `{p}readon`",
     },
     {
         "name": "readoff", "aliases": ["読み上げ停止","読み上げオフ"],
         "usage": "{p}readoff",
-        "desc": "読み上げを停止します。",
+        "desc": "読み上げを停止します。例: `{p}readoff`",
     },
     {
         "name": "readhere", "aliases": ["ここを読み上げ"],
         "usage": "{p}readhere",
-        "desc": "読み上げ対象チャンネルを“今ここ”に変更します。",
+        "desc": "読み上げ対象チャンネルを“今ここ”に変更します。例: `{p}readhere`",
     },
     {
         "name": "stton", "aliases": ["字幕開始","文字起こし開始","字幕オン","音声認識開始"],
         "usage": "{p}stton [区切り秒数(3-60)]",
-        "desc": "ボイスチャンネルの音声を区切って文字起こしし、ここ（またはスレッド）に投稿します。",
+        "desc": "ボイスチャンネルの音声を区切って文字起こしし、ここ（またはスレッド）に投稿します。例: `{p}stton 8`",
     },
     {
         "name": "sttoff", "aliases": ["字幕停止","文字起こし停止","字幕オフ","音声認識停止"],
         "usage": "{p}sttoff",
-        "desc": "音声認識ワーカーを停止します。",
+        "desc": "音声認識ワーカーを停止します。例: `{p}sttoff`",
     },
     {
         "name": "stttest", "aliases": ["文字起こしテスト"],
         "usage": "{p}stttest",
-        "desc": "gTTS→Whisper の疎通テストを行います（日本語固定）。",
+        "desc": "gTTS→Whisper の疎通テストを行います（日本語固定）。例: `{p}stttest`",
     },
     {
         "name": "rectest", "aliases": ["録音テスト"],
         "usage": "{p}rectest [秒数(2-30)]",
-        "desc": "現在のボイスチャンネルを一時録音し、結果を返信します（デバッグ用）。",
+        "desc": "現在のボイスチャンネルを一時録音し、結果を返信します（デバッグ用）。例: `{p}rectest 5`",
     },
     {
         "name": "diag", "aliases": ["診断"],
         "usage": "{p}diag",
-        "desc": "py-cord のバージョンや ffmpeg/PyNaCl などの診断情報を表示します。",
+        "desc": "py-cord のバージョンや ffmpeg/PyNaCl などの診断情報を表示します。例: `{p}diag`",
     },
     {
         "name": "whereami", "aliases": [],
         "usage": "{p}whereami",
-        "desc": "このテキストチャンネル（またはスレッド）の情報を表示します。",
+        "desc": "このテキストチャンネル（またはスレッド）の情報を表示します。例: `{p}whereami`",
     },
     {
         "name": "intentcheck", "aliases": [],
         "usage": "{p}intentcheck",
-        "desc": "Members Intent 等の実際の挙動を簡易チェックします。",
+        "desc": "Members Intent 等の実際の挙動を簡易チェックします。例: `{p}intentcheck`",
     },
     {
         "name": "sttset", "aliases": [],
@@ -1935,52 +1935,52 @@ _HELP_ITEMS = [
     {
         "name": "sttcolor", "aliases": ["字幕色", "color"],
         "usage": "{p}sttcolor [export/import/ユーザー]",
-        "desc": "字幕の色を管理します。0-15 のパレット指定や設定ファイルの入出力に対応します。",
+        "desc": "字幕の色を管理します。0-15 のパレット指定や設定ファイルの入出力に対応します。例: `{p}sttcolor @自分 3`",
     },
     {
         "name": "voicevoxstyles", "aliases": ["voxstyles", "voxlist"],
         "usage": "{p}voicevoxstyles",
-        "desc": "VOICEVOX の話者IDとスタイル名の一覧を表示します。",
+        "desc": "VOICEVOX の話者IDとスタイル名の一覧を表示します。例: `{p}voicevoxstyles`",
     },
     {
         "name": "sttpalette", "aliases": ["colorpalette", "palette"],
         "usage": "{p}sttpalette",
-        "desc": "字幕カラーのパレット番号とカラーコードを確認します。",
+        "desc": "字幕カラーのパレット番号とカラーコードを確認します。例: `{p}sttpalette`",
     },
     {
         "name": "voxdict", "aliases": ["辞書管理"],
         "usage": "{p}voxdict <export|import|add>",
-        "desc": "VOICEVOX のユーザー辞書をエクスポート/インポート/追加します。",
+        "desc": "VOICEVOX のユーザー辞書をエクスポート/インポート/追加します。例: `{p}voxdict add テスト テスト`",
     },
     # ==== 管理者向け（表示制御） ====
     {
         "name": "ttsspeed", "aliases": ["読み上げ速度"],
         "usage": "{p}ttsspeed <倍率>",
-        "desc": "サーバー全体の基準話速を設定します。例: `1.35`（推奨 0.6〜2.0）",
+        "desc": "サーバー全体の基準話速を設定します。例: `{p}ttsspeed 1.35`（推奨 0.6〜2.0）",
         "admin_only": True,
     },
     {
         "name": "ttsvoice", "aliases": ["声色"],
         "usage": "{p}ttsvoice @ユーザー (<半音> [テンポ] | reset)",
-        "desc": "特定ユーザーの声色（半音）とテンポ係数を上書きします（gTTS 利用時のみ）。例: `@太郎 +3 1.10` / `reset`",
+        "desc": "特定ユーザーの声色（半音）とテンポ係数を上書きします（gTTS 利用時のみ）。例: `{p}ttsvoice @太郎 +3 1.10` / `{p}ttsvoice @太郎 reset`",
         "admin_only": True,
     },
     {
         "name": "ttsconfig", "aliases": ["読み上げ設定"],
         "usage": "{p}ttsconfig",
-        "desc": "現在の話速・個別声色オーバーライドの一覧を表示します。",
+        "desc": "現在の話速・個別声色オーバーライドの一覧を表示します。例: `{p}ttsconfig`",
         "admin_only": True,
     },
     {
         "name": "ttsspeaker", "aliases": ["スピーカー", "speaker"],
         "usage": "{p}ttsspeaker [default/export/import/ユーザー]",
-        "desc": "VOICEVOX のデフォルト話者やユーザー別話者IDを管理します（VOICEVOX 利用時のみ）。",
+        "desc": "VOICEVOX のデフォルト話者やユーザー別話者IDを管理します（VOICEVOX 利用時のみ）。例: `{p}ttsspeaker default 2`",
         "admin_only": True,
     },
     {
         "name": "logs", "aliases": ["ログ取得", "getlogs"],
         "usage": "{p}logs",
-        "desc": "TTS/STT のログファイル（CSV）をダウンロードします。",
+        "desc": "TTS/STT のログファイル（CSV）をダウンロードします。例: `{p}logs`",
     },
 ]
 

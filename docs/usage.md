@@ -79,19 +79,29 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 
 ## 基本的な使い方
 
-1. テキストチャンネルで `!join` を実行し、ボイスチャンネルにボットを入室させます。
-   実行ユーザーが参加しているボイスチャンネルへ移動／参加します。
+1. **機能呼び出し**
+   - テキストチャンネルで `!join` を実行し、ボイスチャンネルにボットを入室させます。
+   - ボットは実行ユーザーが参加しているボイスチャンネルへ移動／参加します。
 
 2. **読み上げ**
    - 今いるテキストチャンネルを対象にする: `!readon`
    - 停止: `!readoff`
 
-3. **音声文字起こし (字幕)**
+3. **読み上げ音声種類の指定**
+   - 自分の読み上げ音声種類の変更:  `!ttsspeaker @自分 15`
+   - 読み上げ音声種類一覧の表示: `!voicevoxstyles`
+
+4. **音声文字起こし (字幕)**
    - 開始: `!stton`（デフォルト 10 秒ごとに区切って文字起こし）
    - 例: `!stton 8`（8 秒ごとに区切る）
    - 停止: `!sttoff`
 
-4. 退出: `!leave`
+5. **音声文字起こしの色の指定**
+   - 自分の文字色の変更:  `!sttcolor @自分 3`
+   - 文字色一覧の表示: `!sttpalette`
+
+4. **機能の退出**
+   - 機能を停止: `!leave`
 
 > 読み上げ速度は初期値でも速めに設定しています。さらに調整したい場合は管理者向けコマンドを利用してください。
 
@@ -99,51 +109,84 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 
 ## コマンド一覧（抜粋）
 
-### 基本コマンド
-- `!join` … 今いるボイスチャンネルへ参加
-- `!leave` … 退出
-- `!readon` … 現在のテキストチャンネルの新規投稿を読み上げ
-- `!readoff` … 読み上げ停止
-- `!readhere` … 読み上げ対象チャンネルを“今ここ”に変更
+### 基本操作
+- `!join` … 参加者がいるボイスチャンネルへボットを接続します。例: `!join`
+- `!leave` … ボイスチャンネルから切断します。例: `!leave`
+- `!readon` … 現在のテキストチャンネルを読み上げ対象に設定します。例: `!readon`
+- `!readoff` … 読み上げを停止します。例: `!readoff`
+- `!readhere` … 読み上げ対象のテキストチャンネルを“今ここ”に変更します。例: `!readhere`
 
 ### 文字起こし（STT）
-- `!stton [区切り秒数(3-60)]` … 音声認識を開始し、テキストとして投稿（OpenAI Whisper 使用）
-- `!sttoff` … 音声認識停止
-- `!sttset` … VAD/最小長/マージ等の調整（例）
-  - `!sttset vad 0.008` … 無音判定（RMS）しきい値
-  - `!sttset vaddb -46` … dBFS しきい値
-  - `!sttset mindur 0.4` … 送信する最短区間（秒）
-  - `!sttset merge 14` … 同一話者・近接発話のメッセージ編集マージ秒
-  - `!sttset lang auto` … Whisper の言語自動判定
-  - `!sttset thread on` … 字幕をスレッドに投稿（off で同じチャンネルに投稿）
+- `!stton [3-60]` … 指定秒数ごとに文字起こしを開始します。例: `!stton 8`
+- `!sttoff` … 文字起こしを停止します。例: `!sttoff`
+- `!sttset ...` … STT 設定を調整します。例: `!sttset vad 0.008`, `!sttset lang auto`
+- `!sttcolor ...` … 字幕カラーを管理します。例: `!sttcolor @自分 3`
+- `!sttpalette` … 字幕カラーのパレットをプレビューします。例: `!sttpalette`
 
-> 同一話者が続けて話した場合、`merge_window`（既定 6 秒、`!sttset merge` で変更）以内なら前のメッセージを編集で追記します。
-> 字幕メッセージは16色のパレットからユーザーIDに基づいて色分けされます。`!sttcolor` で個別色を指定したり設定ファイルを入出力できます。
-> パレット番号とカラーコードは `!sttpalette` で一覧表示できます。
+> 同一話者が続けて話した場合、`merge_window`（既定 6 秒、`!sttset merge` で変更）以内なら前メッセージへ追記します。
 
-### 読み上げ（TTS）管理（サーバー管理者のみ）
-- `!ttsspeed <倍率>` … サーバー全体の基準話速を変更（gTTS 利用時のみ。例: `!ttsspeed 1.35`）
-- `!ttsvoice @ユーザー <半音> [テンポ]` … 話者ごとの声色/話速係数を上書き（gTTS 利用時のみ）
-  - 例: `!ttsvoice @太郎 +3 1.10` / 解除: `!ttsvoice @太郎 reset`
-- `!ttsconfig` … 現在の TTS 設定を表示
-- `!ttsspeaker ...` … VOICEVOX 利用時の話者IDを管理（`default` / `export` / `import` / `@ユーザー <id>` 等）
-- `!sttcolor ...` … 字幕カラーを管理（`export` / `import` / `@ユーザー <0-15>` 等）
-- `!voicevoxstyles` … VOICEVOX の話者IDとスタイル名を一覧表示
-- `!sttpalette` … 字幕カラーのパレット番号とカラーコードを表示
-- `!voxdict <export|import|add>` … VOICEVOX のユーザー辞書を管理
+### 読み上げ（TTS）と VOICEVOX
+- `!ttsspeed <倍率>` … サーバー基準の TTS 話速を設定します。例: `!ttsspeed 1.35`
+- `!ttsvoice @ユーザー <半音> [テンポ]` … ユーザー別に声色を調整（gTTS 時）。例: `!ttsvoice @太郎 +3 1.10`
+- `!ttsconfig` … 現在の TTS 設定を確認します。例: `!ttsconfig`
+- `!ttsspeaker ...` … VOICEVOX 話者 ID を管理します。例: `!ttsspeaker default 2`, `!ttsspeaker @自分 5`
+- `!voicevoxstyles` … VOICEVOX の話者/スタイル一覧を取得します。例: `!voicevoxstyles`
+- `!voxdict <export|import|add>` … VOICEVOX のユーザー辞書を管理します。例: `!voxdict add テスト テスト`
 
-> 読み上げを gTTS で行う場合は、FFmpeg フィルタでピッチ（半音）と話速を調整しています。既定で話者ごとに声色が変わるよう自動割り当てされます（ユーザーIDベース）。
-> VOICEVOX を選択した場合は、`.env` で `TTS_PROVIDER=voicevox` を設定し、`VOICEVOX_BASE_URL`/`VOICEVOX_DEFAULT_SPEAKER` と `!ttsspeaker` コマンドを組み合わせて管理します。
+> VOICEVOX を利用する場合は `.env` の `TTS_PROVIDER=voicevox` と `VOICEVOX_BASE_URL` を設定してください。
 
-### デバッグ／補助
-- `!stttest` … gTTS→Whisper の疎通テスト
-- `!rectest [2-30]` … 一時録音テスト
-- `!diag` … 環境診断
-- `!logs` … TTS/STT のログファイル（CSV）を取得
-- `!whereami` … 現在のチャンネル情報
-- `!intentcheck` … intents の動作確認
-- `!help [コマンド名]` … コマンドヘルプを表示
-- `!voxdict` … VOICEVOX 辞書操作のショートヘルプ
+### デバッグ／ユーティリティ
+- `!stttest` … gTTS→Whisper の疎通テストを実行します。例: `!stttest`
+- `!rectest [2-30]` … 現在のボイスチャンネルを指定秒録音します。例: `!rectest 5`
+- `!diag` … 環境診断情報を表示します。例: `!diag`
+- `!logs` … STT/TTS ログ CSV を取得します。例: `!logs`
+- `!whereami` … 現在のテキストチャンネル情報を表示します。例: `!whereami`
+- `!intentcheck` … intents の動作状況を確認します。例: `!intentcheck`
+- `!help [コマンド名]` … コマンドヘルプを表示します。例: `!help stton`
+
+---
+
+
+## バックグラウンド実行
+
+シェルから直接起動するとターミナルが塞がるため、Linux では以下の方法が利用できます。
+
+### systemd サービス
+1. 仮想環境を有効化した状態でパスを確認します。
+2. `/etc/systemd/system/discord-stt-tts-bot.service` を作成し、以下のように記述します。
+   ```ini
+   [Unit]
+   Description=Discord STT/TTS Bot
+   After=network.target
+
+   [Service]
+   Type=simple
+   WorkingDirectory=/path/to/discord-stt-tts-bot
+   Environment="PYTHONUNBUFFERED=1"
+   ExecStart=/path/to/discord-stt-tts-bot/.venv/bin/python -m discord_stt_tts_bot
+   Restart=on-failure
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+3. サービスを有効化・起動します。
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now discord-stt-tts-bot.service
+   sudo systemctl status discord-stt-tts-bot.service
+   ```
+
+### nohup/バックグラウンド実行
+仮想環境を有効化した上で、以下のように実行するとログを `bot.log` に出力しながらバックグラウンドで動作します。
+```bash
+pip install -e .
+source .venv/bin/activate
+nohup python -m discord_stt_tts_bot > bot.log 2>&1 &
+```
+
+### tmux などを使用する
+`tmux` や `screen` などを使ってセッションを維持する方法も有効です。
 
 ---
 
