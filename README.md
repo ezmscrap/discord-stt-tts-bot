@@ -80,6 +80,7 @@ VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:5
    - 固定区切りに切り替え: `!stton fixed 8`（8 秒ごとに強制区切り）
    - ノイズ抑圧の切り替え: `!sttset denoise off`（FFmpeg フィルタを停止）
    - 利用モデルの変更: `!sttset sttmodel gpt-4o-mini-transcribe`（日本語固定）
+   - 指標確認: `!sttstats`（モデル使用回数やフォールバック率・推定コストを表示）
    - 停止: `!sttoff`
 
 5. **音声文字起こしの色の指定**

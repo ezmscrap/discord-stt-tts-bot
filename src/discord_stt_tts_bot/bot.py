@@ -49,6 +49,17 @@ FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 ARNNDN_MODEL = os.getenv("ARNNDN_MODEL_PATH", "").strip()
 DEFAULT_PRIMARY_STT_MODEL = os.getenv("STT_PRIMARY_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
 DEFAULT_FALLBACK_STT_MODEL = os.getenv("STT_FALLBACK_MODEL", "gpt-4o-transcribe").strip() or "gpt-4o-transcribe"
+_DEFAULT_STT_COSTS = {
+    "gpt-4o-mini-transcribe": 0.0006,  # USD per audio minute (近似)
+    "gpt-4o-transcribe": 0.0015,
+    "whisper-1": 0.0006,
+}
+try:
+    _STT_COST_OVERRIDES = json.loads(os.getenv("STT_MODEL_COSTS_JSON", "{}"))
+    if not isinstance(_STT_COST_OVERRIDES, dict):
+        _STT_COST_OVERRIDES = {}
+except Exception:
+    _STT_COST_OVERRIDES = {}
 # === CCFOLIA BRIDGE START: env ===
 CCFO_HOST = os.getenv("CCFOLIA_BRIDGE_HOST", "127.0.0.1")
 CCFO_PORT = int(os.getenv("CCFOLIA_BRIDGE_PORT", "8800"))
@@ -85,6 +96,7 @@ def _resolve_log_dir(base_dir: Path, env_value: str | None) -> Path:
 LOG_DIR = _resolve_log_dir(PROJECT_ROOT, os.getenv("LOG_DIR"))
 TTS_LOG_PATH = LOG_DIR / "tts_logs.csv"
 STT_LOG_PATH = LOG_DIR / "stt_logs.csv"
+STT_METRICS_PATH = LOG_DIR / "stt_metrics.csv"
 CCFO_LOG_PATH = LOG_DIR / "ccfolia_event_logs.csv"
 _log_lock = asyncio.Lock()  # 複数タスクからの同時書き込みを保護
 print(f"[LOG] output directory: {LOG_DIR}")  # 起動時に出力先を表示
@@ -104,6 +116,23 @@ _ensure_csv_with_header(
 _ensure_csv_with_header(
     STT_LOG_PATH,
     ["timestamp_iso", "guild_id", "dest_channel_id", "user_id", "user_display", "text", "duration_sec", "rms", "dbfs"],
+)
+_ensure_csv_with_header(
+    STT_METRICS_PATH,
+    [
+        "timestamp_iso",
+        "guild_id",
+        "user_id",
+        "model",
+        "fallback_used",
+        "duration_sec",
+        "avg_logprob",
+        "no_speech_prob",
+        "compression_ratio",
+        "token_count",
+        "estimated_cost_usd",
+        "text_length",
+    ],
 )
 _ensure_csv_with_header(
     CCFO_LOG_PATH,
@@ -163,6 +192,90 @@ async def log_stt_event(
         f"{dbfs:.2f}" if isinstance(dbfs, (int, float)) else "",
     ]
     await _append_csv(STT_LOG_PATH, row)
+
+
+async def log_stt_metrics(
+    guild_id: int,
+    user_id: int,
+    model: str,
+    fallback_used: bool,
+    duration: float | None,
+    avg_logprob: float | None,
+    no_speech_prob: float | None,
+    compression_ratio: float | None,
+    token_count: int | None,
+    estimated_cost: float | None,
+    text_length: int,
+):
+    ts = datetime.now(timezone.utc).isoformat()
+    row = [
+        ts,
+        guild_id or 0,
+        user_id,
+        model or "",
+        int(bool(fallback_used)),
+        f"{duration:.3f}" if isinstance(duration, (int, float)) else "",
+        f"{avg_logprob:.3f}" if isinstance(avg_logprob, (int, float)) else "",
+        f"{no_speech_prob:.3f}" if isinstance(no_speech_prob, (int, float)) else "",
+        f"{compression_ratio:.3f}" if isinstance(compression_ratio, (int, float)) else "",
+        str(int(token_count)) if isinstance(token_count, (int, float)) else "",
+        f"{estimated_cost:.6f}" if isinstance(estimated_cost, (int, float)) else "",
+        str(int(text_length)) if isinstance(text_length, (int, float)) else "",
+    ]
+    await _append_csv(STT_METRICS_PATH, row)
+
+
+def _evaluate_transcription_response(resp, text: str, duration: float | None) -> tuple[dict, bool]:
+    metrics: dict[str, float | int | None] = {
+        "avg_logprob": None,
+        "no_speech_prob": None,
+        "compression_ratio": None,
+        "token_count": None,
+    }
+    segments = getattr(resp, "segments", None)
+    avg_logprob_acc: list[float] = []
+    token_total = 0
+    if isinstance(segments, (list, tuple)):
+        for seg in segments:
+            if isinstance(seg, dict):
+                val = seg.get("avg_logprob")
+                if isinstance(val, (int, float)):
+                    avg_logprob_acc.append(float(val))
+                ns = seg.get("no_speech_prob")
+                if metrics["no_speech_prob"] is None and isinstance(ns, (int, float)):
+                    metrics["no_speech_prob"] = float(ns)
+                tokens = seg.get("tokens")
+                if isinstance(tokens, (list, tuple)):
+                    token_total += len(tokens)
+    if avg_logprob_acc:
+        metrics["avg_logprob"] = sum(avg_logprob_acc) / len(avg_logprob_acc)
+    comp = getattr(resp, "compression_ratio", None)
+    if isinstance(comp, (int, float)):
+        metrics["compression_ratio"] = float(comp)
+    if token_total > 0:
+        metrics["token_count"] = token_total
+    else:
+        tokens_attr = getattr(resp, "tokens", None)
+        if isinstance(tokens_attr, (list, tuple)):
+            metrics["token_count"] = len(tokens_attr)
+
+    should_retry = False
+    text_len = len(text or "")
+    dur = duration or 0.0
+    avg_logprob = metrics["avg_logprob"]
+    no_speech_prob = metrics["no_speech_prob"]
+    compression_ratio = metrics["compression_ratio"]
+
+    if isinstance(avg_logprob, (int, float)) and avg_logprob < -0.7:
+        should_retry = True
+    if isinstance(no_speech_prob, (int, float)) and no_speech_prob > 0.8:
+        should_retry = True
+    if isinstance(compression_ratio, (int, float)) and compression_ratio > 2.4:
+        should_retry = True
+    if text_len <= 4 and dur >= 2.0:
+        should_retry = True
+
+    return metrics, should_retry
 
 async def log_ccfolia_event(
     user_display: str,
@@ -727,6 +840,17 @@ async def _maybe_denoise_wav(raw: bytes, st: dict) -> bytes:
     return stdout_data
 
 
+def _estimate_stt_cost(model: str, duration_sec: float) -> float:
+    rate = _STT_COST_OVERRIDES.get(model)
+    if not isinstance(rate, (int, float)):
+        rate = _DEFAULT_STT_COSTS.get(model, 0.0)
+    try:
+        minutes = max(0.0, float(duration_sec)) / 60.0
+    except Exception:
+        minutes = 0.0
+    return minutes * float(rate)
+
+
 async def transcribe_and_post(src, channel, username: str):
     if not openai:
         print("[STT] OpenAI client is None"); return
@@ -901,6 +1025,13 @@ def get_state(guild_id):
             tts_default_speaker=VOICEVOX_DEFAULT_SPEAKER,
             tts_speakers={},    # { user_id: speaker_id }
             stt_color_overrides={},  # { user_id: palette_index }
+            stt_metrics=dict(
+                total_calls=0,
+                fallback_calls=0,
+                total_duration=0.0,
+                total_cost=0.0,
+                model_usage=collections.Counter(),
+            ),
         )
     return guild_state[guild_id]
 
@@ -1397,6 +1528,30 @@ async def sttoff(ctx: commands.Context):
     await ctx.reply("音声認識を停止しました。")
 
 
+@bot.command(name="sttstats", aliases=["stt統計", "sttmetrics"])
+async def sttstats(ctx: commands.Context):
+    st = get_state(ctx.guild.id)
+    metrics = st.get("stt_metrics") or {}
+    total = metrics.get("total_calls", 0)
+    fallback = metrics.get("fallback_calls", 0)
+    duration = metrics.get("total_duration", 0.0)
+    cost = metrics.get("total_cost", 0.0)
+    usage = metrics.get("model_usage")
+    lines = []
+    lines.append(f"総トランスクリプト数: {total}")
+    if total:
+        lines.append(f"フォールバック発生: {fallback} ({(fallback/total)*100:.1f}%)")
+    else:
+        lines.append("フォールバック発生: 0")
+    lines.append(f"累計音声長: {duration:.1f} 秒")
+    lines.append(f"推定コスト: ${cost:.4f}")
+    if isinstance(usage, collections.Counter) and usage:
+        top_models = usage.most_common(5)
+        model_text = ", ".join(f"{name}:{count}" for name, count in top_models)
+        lines.append(f"モデル使用回数: {model_text}")
+    await ctx.reply("STT指標概要:\n" + "\n".join(lines))
+
+
 @bot.command(name="readhere", aliases=["ここを読み上げ"])
 async def readhere(ctx: commands.Context):
     if not ctx.guild.voice_client or not ctx.guild.voice_client.is_connected():
@@ -1880,7 +2035,7 @@ async def download_logs(ctx: commands.Context):
     """音声関連ログ（TTS/STT）を取得して送信する。"""
     files: list[discord.File] = []
     async with _log_lock:
-        for path in (TTS_LOG_PATH, STT_LOG_PATH, CCFO_LOG_PATH):
+        for path in (TTS_LOG_PATH, STT_LOG_PATH, STT_METRICS_PATH, CCFO_LOG_PATH):
             if path.exists():
                 data = path.read_bytes()
                 buff = io.BytesIO(data)
@@ -2346,9 +2501,10 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
 
     text = ""
     used_model = None
+    used_metrics: dict[str, float | int | None] = {}
     last_error: Exception | None = None
 
-    for model_name in models_to_try:
+    for idx, model_name in enumerate(models_to_try):
         try:
             bio = io.BytesIO(buf)
             bio.name = "audio.wav"
@@ -2358,11 +2514,17 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
                 language="ja",
             )
             candidate = (getattr(resp, "text", "") or "").strip()
-            print(f"[STT] {model_name} result: {candidate!r}")
+            metrics_candidate, retry_flag = _evaluate_transcription_response(resp, candidate, dur)
+            print(f"[STT] {model_name} result: {candidate!r} retry={retry_flag}")
             if candidate:
                 text = candidate
                 used_model = model_name
-                break
+                used_metrics = metrics_candidate
+                if not retry_flag or idx == len(models_to_try) - 1:
+                    break
+                else:
+                    print(f"[STT] retry requested, moving to next model after {model_name}")
+                    continue
         except Exception as exc:
             last_error = exc
             print(f"[STT] transcription via {model_name} failed:", repr(exc))
@@ -2390,6 +2552,36 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
 
     if used_model and used_model != st.get("stt_primary_model"):
         print(f"[STT] fallback model used: {used_model}")
+
+    fallback_used = bool(used_model and used_model != (st.get("stt_primary_model") or DEFAULT_PRIMARY_STT_MODEL))
+    estimated_cost = _estimate_stt_cost(used_model or "", dur or 0.0)
+    token_count = used_metrics.get("token_count") if used_metrics else None
+    await log_stt_metrics(
+        guild_id=guild_id,
+        user_id=user_id,
+        model=used_model or "unknown",
+        fallback_used=fallback_used,
+        duration=float(dur) if isinstance(dur, (int, float)) else None,
+        avg_logprob=used_metrics.get("avg_logprob") if used_metrics else None,
+        no_speech_prob=used_metrics.get("no_speech_prob") if used_metrics else None,
+        compression_ratio=used_metrics.get("compression_ratio") if used_metrics else None,
+        token_count=token_count if isinstance(token_count, (int, float)) else None,
+        estimated_cost=estimated_cost,
+        text_length=len(text or ""),
+    )
+
+    metrics_state = st.get("stt_metrics")
+    if isinstance(metrics_state, dict):
+        metrics_state["total_calls"] = metrics_state.get("total_calls", 0) + 1
+        if fallback_used:
+            metrics_state["fallback_calls"] = metrics_state.get("fallback_calls", 0) + 1
+        metrics_state["total_duration"] = metrics_state.get("total_duration", 0.0) + (float(dur) if isinstance(dur, (int, float)) else 0.0)
+        metrics_state["total_cost"] = metrics_state.get("total_cost", 0.0) + estimated_cost
+        usage = metrics_state.get("model_usage")
+        if isinstance(usage, collections.Counter):
+            usage[used_model or "unknown"] += 1
+        else:
+            metrics_state["model_usage"] = collections.Counter({used_model or "unknown": 1})
 
     # キャプション投稿（連投マージ対応）
     await post_caption(guild_id, channel, user_id, username, jp_cleanup(text))
@@ -2475,6 +2667,11 @@ _HELP_ITEMS = [
             "VAD・ノイズ抑圧・利用モデルなど認識設定を調整します（言語は日本語固定）。"
             " 例: `{p}sttset vad 0.008`, `{p}sttset vadlevel 3`, `{p}sttset sttmodel gpt-4o-mini-transcribe`"
         ),
+    },
+    {
+        "name": "sttstats", "aliases": ["stt統計", "sttmetrics"],
+        "usage": "{p}sttstats",
+        "desc": "モデル使用回数やフォールバック率、想定コストなど、直近の音声認識指標を表示します。例: `{p}sttstats`",
     },
     {
         "name": "sttcolor", "aliases": ["字幕色", "color"],
