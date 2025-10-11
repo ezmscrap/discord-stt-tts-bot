@@ -94,6 +94,7 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 4. **音声文字起こし (字幕)**
    - 開始: `!stton`（既定は VAD による自動区切り）
    - 固定区切りに切り替え: `!stton fixed 8`（8 秒ごとに強制区切り）
+   - ノイズ抑圧の切り替え: `!sttset denoise off`（FFmpeg フィルタを停止）
    - 停止: `!sttoff`
 
 5. **音声文字起こしの色の指定**
@@ -119,7 +120,7 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 ### 文字起こし（STT）
 - `!stton [vad|fixed] [3-60]` … 文字起こしを開始します。例: `!stton`, `!stton fixed 8`
 - `!sttoff` … 文字起こしを停止します。例: `!sttoff`
-- `!sttset ...` … STT 設定を調整します。例: `!sttset vad 0.008`, `!sttset vadlevel 3`
+- `!sttset ...` … STT 設定を調整します。例: `!sttset vad 0.008`, `!sttset vadlevel 3`, `!sttset denoise off`
 - `!sttcolor ...` … 字幕カラーを管理します。例: `!sttcolor @自分 3`
 - `!sttpalette` … 字幕カラーのパレットをプレビューします。例: `!sttpalette`
 
@@ -208,6 +209,9 @@ nohup python -m discord_stt_tts_bot > bot.log 2>&1 &
 
 - **ログ出力先を変更したい**
   - `.env` の `LOG_DIR` を変更してください。
+- **ノイズ抑圧が効いていない/エラーが出る**
+  - `ffmpeg` コマンドが利用できるか確認してください。インストール済みであれば `!sttset denoise off` で一時的に無効化できます。
+  - `ARNNDN_MODEL_PATH` を設定すると、FFmpeg `arnndn` モデルを明示できます（未設定時は自動で `afftdn` にフォールバックします）。
 
 ---
 

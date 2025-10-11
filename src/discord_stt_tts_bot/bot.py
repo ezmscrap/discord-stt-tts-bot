@@ -1,6 +1,7 @@
 import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time,csv, json
 import audioop
 import collections
+import shutil
 import discord
 import typing as T
 
@@ -44,6 +45,8 @@ TTS_PROVIDER = os.getenv("TTS_PROVIDER", "gtts").strip().lower() or "gtts"
 VOICEVOX_BASE_URL = (os.getenv("VOICEVOX_BASE_URL", "http://127.0.0.1:50021").strip().rstrip("/"))
 VOICEVOX_TIMEOUT = float(os.getenv("VOICEVOX_TIMEOUT", "15"))
 VOICEVOX_DEFAULT_SPEAKER = int(os.getenv("VOICEVOX_DEFAULT_SPEAKER", "2"))
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+ARNNDN_MODEL = os.getenv("ARNNDN_MODEL_PATH", "").strip()
 # === CCFOLIA BRIDGE START: env ===
 CCFO_HOST = os.getenv("CCFOLIA_BRIDGE_HOST", "127.0.0.1")
 CCFO_PORT = int(os.getenv("CCFOLIA_BRIDGE_PORT", "8800"))
@@ -635,6 +638,93 @@ class _VadUserStream:
         self._silence_counter = 0
         self._post_counter = -1
 
+
+def _build_denoise_filter_chain(st: dict) -> str:
+    filters: list[str] = []
+    hp = int(st.get("denoise_highpass", 0) or 0)
+    lp = int(st.get("denoise_lowpass", 0) or 0)
+    if hp > 0:
+        filters.append(f"highpass=f={hp}")
+    if lp > 0:
+        filters.append(f"lowpass=f={lp}")
+
+    mode = (st.get("denoise_mode") or "").lower()
+    if mode == "arnndn":
+        model = (st.get("denoise_model") or "").strip()
+        if model:
+            filters.append(f"arnndn=m={model}")
+        else:
+            filters.append("arnndn")
+    elif mode == "afftdn":
+        strength = float(st.get("denoise_strength", 12.0) or 0.0)
+        filters.append(f"afftdn=nr={strength:.1f}")
+
+    gain = float(st.get("denoise_gain", 0.0) or 0.0)
+    if gain > 0.0:
+        filters.append(f"dynaudnorm=f=150:g={gain:.1f}")
+
+    comp = (st.get("denoise_compand") or "").strip()
+    if comp:
+        filters.append(f"compand={comp}")
+
+    return ",".join(filters)
+
+
+async def _maybe_denoise_wav(raw: bytes, st: dict) -> bytes:
+    if not raw or len(raw) <= 44:
+        return raw
+    if not st.get("denoise_enable", False):
+        return raw
+    if st.get("denoise_ffmpeg_failed"):
+        return raw
+
+    ffmpeg_path = shutil.which(FFMPEG_BIN)
+    if not ffmpeg_path:
+        st["denoise_ffmpeg_failed"] = True
+        print("[STT] denoise skipped: ffmpeg not found")
+        return raw
+
+    filters = _build_denoise_filter_chain(st)
+    if not filters:
+        return raw
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", "pipe:0",
+            "-af", filters,
+            "-f", "wav",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        st["denoise_ffmpeg_failed"] = True
+        print("[STT] denoise skipped: ffmpeg execution failed")
+        return raw
+
+    try:
+        stdout_data, stderr_data = await proc.communicate(raw)
+    except Exception as exc:
+        st["denoise_ffmpeg_failed"] = True
+        print("[STT] denoise failed during execution:", repr(exc))
+        return raw
+
+    if proc.returncode != 0 or not stdout_data:
+        st["denoise_ffmpeg_failed"] = True
+        err_excerpt = (stderr_data or b"").decode("utf-8", errors="ignore").strip()
+        if err_excerpt:
+            print("[STT] denoise ffmpeg error:", err_excerpt)
+        else:
+            print("[STT] denoise ffmpeg returned empty output")
+        return raw
+
+    return stdout_data
+
+
 async def transcribe_and_post(src, channel, username: str):
     if not openai:
         print("[STT] OpenAI client is None"); return
@@ -788,6 +878,15 @@ def get_state(guild_id):
             vad_post_ms=400,
             vad_overlap_ms=320,
             vad_max_segment_ms=20000,
+            denoise_enable=True,
+            denoise_mode=("arnndn" if ARNNDN_MODEL else "afftdn"),
+            denoise_model=ARNNDN_MODEL,
+            denoise_highpass=120,
+            denoise_lowpass=7000,
+            denoise_strength=12.0,
+            denoise_gain=15.0,
+            denoise_compand="attacks=10:decays=100:points=-70/-90|-40/-20|0/-2",
+            denoise_ffmpeg_failed=False,
             lang="ja",
             use_thread=False,
             caption_dest_id=None,
@@ -1799,6 +1898,8 @@ async def sttset(ctx, key: str=None, value: str=None):
       !sttset mergeauto on/off
       !sttset lang auto
       !sttset thread on
+      !sttset denoise on/off
+      !sttset denoisemode arnndn
     """
     st = get_state(ctx.guild.id)
     if not key:
@@ -1806,7 +1907,8 @@ async def sttset(ctx, key: str=None, value: str=None):
             (
                 "設定: mode={stt_mode} window={record_window}s vad={vad_rms} vaddb={vad_db} "
                 "mindur={min_dur}s merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread} "
-                "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms"
+                "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms "
+                "denoise={denoise_enable} dmode={denoise_mode} hp={denoise_highpass} lp={denoise_lowpass} strength={denoise_strength} gain={denoise_gain}"
             ).format(**st)
         )
 
@@ -1850,10 +1952,38 @@ async def sttset(ctx, key: str=None, value: str=None):
             st["vad_post_ms"] = max(0, min(1500, int(value)))
         elif k in ("vadoverlap", "overlap"):
             st["vad_overlap_ms"] = max(0, min(1000, int(value)))
+        elif k in ("denoise", "dn"):
+            st["denoise_enable"] = value.lower() in ("on", "true", "1", "yes", "y")
+            st["denoise_ffmpeg_failed"] = False
+        elif k in ("denoisemode", "dnmode"):
+            lv = value.lower()
+            if lv not in ("arnndn", "afftdn"):
+                return await ctx.reply("denoisemode は `arnndn` または `afftdn` を指定してください。")
+            st["denoise_mode"] = lv
+            st["denoise_ffmpeg_failed"] = False
+        elif k in ("denoisemodel", "dnmodel"):
+            st["denoise_model"] = value
+            st["denoise_ffmpeg_failed"] = False
+        elif k in ("denoisehp", "dnhp"):
+            st["denoise_highpass"] = max(0, min(2000, int(value)))
+            st["denoise_ffmpeg_failed"] = False
+        elif k in ("denoiselp", "dnlp"):
+            st["denoise_lowpass"] = max(1000, min(20000, int(value)))
+            st["denoise_ffmpeg_failed"] = False
+        elif k in ("denoisestr", "dnstr", "dnstrength"):
+            st["denoise_strength"] = max(0.0, min(30.0, float(value)))
+            st["denoise_ffmpeg_failed"] = False
+        elif k in ("denoisegain", "dngain"):
+            st["denoise_gain"] = max(0.0, min(30.0, float(value)))
+            st["denoise_ffmpeg_failed"] = False
+        elif k in ("denoisecomp", "dncomp"):
+            st["denoise_compand"] = value
+            st["denoise_ffmpeg_failed"] = False
         else:
             return await ctx.reply(
                 "未知のキー: vad / vaddb / mindur / merge / mergeauto / lang / thread / "
-                "mode / window / vadlevel / vadsilence / vadpre / vadpost / vadoverlap"
+                "mode / window / vadlevel / vadsilence / vadpre / vadpost / vadoverlap / "
+                "denoise / denoisemode / denoisemodel / denoisehp / denoiselp / denoisestr / denoisegain / denoisecomp"
             )
     except Exception as e:
         return await ctx.reply(f"設定失敗: {e!r}")
@@ -1862,7 +1992,8 @@ async def sttset(ctx, key: str=None, value: str=None):
         (
             "OK: mode={stt_mode} window={record_window}s vad={vad_rms} vaddb={vad_db} "
             "mindur={min_dur}s merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread} "
-            "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms"
+            "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms "
+            "denoise={denoise_enable} dmode={denoise_mode} hp={denoise_highpass} lp={denoise_lowpass} strength={denoise_strength} gain={denoise_gain}"
         ).format(**st)
     )
 
@@ -2154,6 +2285,13 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
         print("[STT] OpenAI client is None"); return
     st = get_state(guild_id)
 
+    try:
+        processed = await _maybe_denoise_wav(buf, st)
+        if processed:
+            buf = processed
+    except Exception:
+        traceback.print_exc()
+
     # --- VAD（無音スキップの条件を緩める）---
     dur = None
     rms = None
@@ -2292,11 +2430,11 @@ _HELP_ITEMS = [
         "name": "sttset", "aliases": [],
         "usage": (
             "{p}sttset <key> <value> / key: vad | vaddb | mindur | merge | mergeauto | lang | thread | "
-            "mode | window | vadlevel | vadsilence | vadpre | vadpost | vadoverlap"
+            "mode | window | vadlevel | vadsilence | vadpre | vadpost | vadoverlap | denoise | denoisemode | denoisemodel | denoisehp | denoiselp | denoisestr | denoisegain"
         ),
         "desc": (
-            "VADしきい値やタイマー区切りなど認識設定を調整します。"
-            " 例: `{p}sttset vad 0.008`, `{p}sttset vadlevel 3`, `{p}sttset mode fixed`"
+            "VAD・ノイズ抑圧・区切り時間などの認識設定を調整します。"
+            " 例: `{p}sttset vad 0.008`, `{p}sttset vadlevel 3`, `{p}sttset denoise off`"
         ),
     },
     {
