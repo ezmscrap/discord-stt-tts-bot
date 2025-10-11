@@ -95,6 +95,7 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
    - 開始: `!stton`（既定は VAD による自動区切り）
    - 固定区切りに切り替え: `!stton fixed 8`（8 秒ごとに強制区切り）
    - ノイズ抑圧の切り替え: `!sttset denoise off`（FFmpeg フィルタを停止）
+   - 利用モデルの変更: `!sttset sttmodel gpt-4o-mini-transcribe`（日本語固定）
    - 停止: `!sttoff`
 
 5. **音声文字起こしの色の指定**
@@ -120,11 +121,12 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 ### 文字起こし（STT）
 - `!stton [vad|fixed] [3-60]` … 文字起こしを開始します。例: `!stton`, `!stton fixed 8`
 - `!sttoff` … 文字起こしを停止します。例: `!sttoff`
-- `!sttset ...` … STT 設定を調整します。例: `!sttset vad 0.008`, `!sttset vadlevel 3`, `!sttset denoise off`
+- `!sttset ...` … STT 設定を調整します。例: `!sttset vad 0.008`, `!sttset vadlevel 3`, `!sttset sttmodel gpt-4o-mini-transcribe`
 - `!sttcolor ...` … 字幕カラーを管理します。例: `!sttcolor @自分 3`
 - `!sttpalette` … 字幕カラーのパレットをプレビューします。例: `!sttpalette`
 
 > 同一話者が続けて話した場合、`merge_window`（既定 6 秒、`!sttset merge` で変更）以内なら前メッセージへ追記します。
+> 音声認識モデルは既定で `gpt-4o-mini-transcribe` を利用し、日本語 (`language="ja"`) 固定です。必要に応じて `!sttset sttmodel` / `sttmodel2` でモデル名を切り替えられます。
 
 ### 読み上げ（TTS）と VOICEVOX
 - `!ttsspeed <倍率>` … サーバー基準の TTS 話速を設定します。例: `!ttsspeed 1.35`

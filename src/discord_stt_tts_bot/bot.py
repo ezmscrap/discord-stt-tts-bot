@@ -47,6 +47,8 @@ VOICEVOX_TIMEOUT = float(os.getenv("VOICEVOX_TIMEOUT", "15"))
 VOICEVOX_DEFAULT_SPEAKER = int(os.getenv("VOICEVOX_DEFAULT_SPEAKER", "2"))
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 ARNNDN_MODEL = os.getenv("ARNNDN_MODEL_PATH", "").strip()
+DEFAULT_PRIMARY_STT_MODEL = os.getenv("STT_PRIMARY_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+DEFAULT_FALLBACK_STT_MODEL = os.getenv("STT_FALLBACK_MODEL", "gpt-4o-transcribe").strip() or "gpt-4o-transcribe"
 # === CCFOLIA BRIDGE START: env ===
 CCFO_HOST = os.getenv("CCFOLIA_BRIDGE_HOST", "127.0.0.1")
 CCFO_PORT = int(os.getenv("CCFOLIA_BRIDGE_PORT", "8800"))
@@ -888,6 +890,8 @@ def get_state(guild_id):
             denoise_compand="attacks=10:decays=100:points=-70/-90|-40/-20|0/-2",
             denoise_ffmpeg_failed=False,
             lang="ja",
+            stt_primary_model=DEFAULT_PRIMARY_STT_MODEL,
+            stt_fallback_model=DEFAULT_FALLBACK_STT_MODEL,
             use_thread=False,
             caption_dest_id=None,
             last_msgs={},
@@ -1896,10 +1900,12 @@ async def sttset(ctx, key: str=None, value: str=None):
       !sttset mindur 0.4
       !sttset merge 14
       !sttset mergeauto on/off
-      !sttset lang auto
+      !sttset lang ja
       !sttset thread on
       !sttset denoise on/off
       !sttset denoisemode arnndn
+      !sttset sttmodel gpt-4o-mini-transcribe
+      !sttset sttmodel2 gpt-4o-transcribe
     """
     st = get_state(ctx.guild.id)
     if not key:
@@ -1908,7 +1914,8 @@ async def sttset(ctx, key: str=None, value: str=None):
                 "設定: mode={stt_mode} window={record_window}s vad={vad_rms} vaddb={vad_db} "
                 "mindur={min_dur}s merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread} "
                 "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms "
-                "denoise={denoise_enable} dmode={denoise_mode} hp={denoise_highpass} lp={denoise_lowpass} strength={denoise_strength} gain={denoise_gain}"
+                "denoise={denoise_enable} dmode={denoise_mode} hp={denoise_highpass} lp={denoise_lowpass} strength={denoise_strength} gain={denoise_gain} "
+                "model={stt_primary_model} fallback={stt_fallback_model}"
             ).format(**st)
         )
 
@@ -1925,7 +1932,9 @@ async def sttset(ctx, key: str=None, value: str=None):
         elif k in ("mergeauto","ma"):
             st["merge_auto"] = (value.lower() in ("on","true","1","yes","y"))
         elif k == "lang":
-            st["lang"] = value.lower()
+            st["lang"] = "ja"
+            if value and value.lower() not in ("ja", "japanese", "日本語", "jp"):
+                return await ctx.reply("言語は日本語固定です（lang=ja）。")
         elif k in ("thread","th"):
             st["use_thread"] = (value.lower() in ("on","true","1","yes","y"))
             st["caption_dest_id"] = None
@@ -1979,11 +1988,19 @@ async def sttset(ctx, key: str=None, value: str=None):
         elif k in ("denoisecomp", "dncomp"):
             st["denoise_compand"] = value
             st["denoise_ffmpeg_failed"] = False
+        elif k in ("sttmodel", "model", "primarymodel"):
+            if not value:
+                return await ctx.reply("モデル名を指定してください。例: gpt-4o-mini-transcribe")
+            st["stt_primary_model"] = value.strip()
+        elif k in ("sttmodel2", "fallback", "secondarymodel"):
+            if not value:
+                return await ctx.reply("フォールバックモデル名を指定してください。例: gpt-4o-transcribe")
+            st["stt_fallback_model"] = value.strip()
         else:
             return await ctx.reply(
                 "未知のキー: vad / vaddb / mindur / merge / mergeauto / lang / thread / "
                 "mode / window / vadlevel / vadsilence / vadpre / vadpost / vadoverlap / "
-                "denoise / denoisemode / denoisemodel / denoisehp / denoiselp / denoisestr / denoisegain / denoisecomp"
+                "denoise / denoisemode / denoisemodel / denoisehp / denoiselp / denoisestr / denoisegain / denoisecomp / sttmodel / sttmodel2"
             )
     except Exception as e:
         return await ctx.reply(f"設定失敗: {e!r}")
@@ -1993,7 +2010,8 @@ async def sttset(ctx, key: str=None, value: str=None):
             "OK: mode={stt_mode} window={record_window}s vad={vad_rms} vaddb={vad_db} "
             "mindur={min_dur}s merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread} "
             "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms "
-            "denoise={denoise_enable} dmode={denoise_mode} hp={denoise_highpass} lp={denoise_lowpass} strength={denoise_strength} gain={denoise_gain}"
+            "denoise={denoise_enable} dmode={denoise_mode} hp={denoise_highpass} lp={denoise_lowpass} strength={denoise_strength} gain={denoise_gain} "
+            "model={stt_primary_model} fallback={stt_fallback_model}"
         ).format(**st)
     )
 
@@ -2312,48 +2330,69 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
     except Exception:
         traceback.print_exc()
 
-    # --- Whisper ---
-    tmp = None; fh = None
-    try:
-        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tmp = tf.name; tf.write(buf); tf.close()
-        fh = open(tmp, "rb")
+    # --- STT モデル適用 ---
+    models_to_try: list[str] = []
+    primary_model = (st.get("stt_primary_model") or DEFAULT_PRIMARY_STT_MODEL).strip()
+    fallback_model = (st.get("stt_fallback_model") or DEFAULT_FALLBACK_STT_MODEL).strip()
 
-        kwargs = {}
-        if st["lang"] != "auto":
-            kwargs["language"] = st["lang"]
+    def _append_model(name: str):
+        n = (name or "").strip()
+        if n and n not in models_to_try:
+            models_to_try.append(n)
 
-        resp = openai.audio.transcriptions.create(file=fh, model="whisper-1", **kwargs)
-        text = (getattr(resp, "text", "") or "").strip()
-        print(f"[STT] Whisper result: {text!r}")
+    _append_model(primary_model)
+    _append_model(fallback_model)
+    _append_model("whisper-1")  # 最終フォールバック
 
-        if text:
-            # ★ ログ: 音声認識テキスト・発言者・記録時刻（近似）
-            dest_id = getattr(channel, "id", 0)
-            await log_stt_event(
-                guild_id=guild_id,
-                dest_channel_id=dest_id,
-                user_id=user_id,
-                user_display=username,
-                text=text,
-                duration=float(dur) if dur is not None else None,
-                rms=float(rms) if rms is not None else None,
-                dbfs=float(db) if db is not None else None,
-            )
+    text = ""
+    used_model = None
+    last_error: Exception | None = None
 
-            # キャプション投稿（連投マージ対応）
-            await post_caption(guild_id, channel, user_id, username, jp_cleanup(text))
-
-    except Exception as e:
-        print("[STT] Transcription failed:", repr(e))
-        traceback.print_exc()
-    finally:
+    for model_name in models_to_try:
         try:
-            if fh: fh.close()
-        finally:
-            if tmp:
-                try: os.remove(tmp)
-                except: pass
+            bio = io.BytesIO(buf)
+            bio.name = "audio.wav"
+            resp = openai.audio.transcriptions.create(
+                file=bio,
+                model=model_name,
+                language="ja",
+            )
+            candidate = (getattr(resp, "text", "") or "").strip()
+            print(f"[STT] {model_name} result: {candidate!r}")
+            if candidate:
+                text = candidate
+                used_model = model_name
+                break
+        except Exception as exc:
+            last_error = exc
+            print(f"[STT] transcription via {model_name} failed:", repr(exc))
+            traceback.print_exc()
+
+    if not text:
+        if last_error:
+            print("[STT] all models failed; last error:", repr(last_error))
+        else:
+            print("[STT] transcription produced empty text even after fallbacks")
+        return
+
+    # ★ ログ: 音声認識テキスト・発言者・記録時刻（近似）
+    dest_id = getattr(channel, "id", 0)
+    await log_stt_event(
+        guild_id=guild_id,
+        dest_channel_id=dest_id,
+        user_id=user_id,
+        user_display=username,
+        text=text,
+        duration=float(dur) if dur is not None else None,
+        rms=float(rms) if rms is not None else None,
+        dbfs=float(db) if db is not None else None,
+    )
+
+    if used_model and used_model != st.get("stt_primary_model"):
+        print(f"[STT] fallback model used: {used_model}")
+
+    # キャプション投稿（連投マージ対応）
+    await post_caption(guild_id, channel, user_id, username, jp_cleanup(text))
 
 
 # =========================
@@ -2430,11 +2469,11 @@ _HELP_ITEMS = [
         "name": "sttset", "aliases": [],
         "usage": (
             "{p}sttset <key> <value> / key: vad | vaddb | mindur | merge | mergeauto | lang | thread | "
-            "mode | window | vadlevel | vadsilence | vadpre | vadpost | vadoverlap | denoise | denoisemode | denoisemodel | denoisehp | denoiselp | denoisestr | denoisegain"
+            "mode | window | vadlevel | vadsilence | vadpre | vadpost | vadoverlap | denoise | denoisemode | denoisemodel | denoisehp | denoiselp | denoisestr | denoisegain | sttmodel | sttmodel2"
         ),
         "desc": (
-            "VAD・ノイズ抑圧・区切り時間などの認識設定を調整します。"
-            " 例: `{p}sttset vad 0.008`, `{p}sttset vadlevel 3`, `{p}sttset denoise off`"
+            "VAD・ノイズ抑圧・利用モデルなど認識設定を調整します（言語は日本語固定）。"
+            " 例: `{p}sttset vad 0.008`, `{p}sttset vadlevel 3`, `{p}sttset sttmodel gpt-4o-mini-transcribe`"
         ),
     },
     {
