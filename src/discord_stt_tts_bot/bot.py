@@ -12,6 +12,10 @@ from openai import OpenAI
 from pathlib import Path
 import requests
 
+# === CCFOLIA BRIDGE START: import ===
+from aiohttp import web
+# === CCFOLIA BRIDGE END: import ===
+
 PACKAGE_DIR = Path(__file__).resolve().parent
 SRC_DIR = PACKAGE_DIR.parent
 if SRC_DIR.name == "src":
@@ -33,6 +37,18 @@ TTS_PROVIDER = os.getenv("TTS_PROVIDER", "gtts").strip().lower() or "gtts"
 VOICEVOX_BASE_URL = (os.getenv("VOICEVOX_BASE_URL", "http://127.0.0.1:50021").strip().rstrip("/"))
 VOICEVOX_TIMEOUT = float(os.getenv("VOICEVOX_TIMEOUT", "15"))
 VOICEVOX_DEFAULT_SPEAKER = int(os.getenv("VOICEVOX_DEFAULT_SPEAKER", "2"))
+# === CCFOLIA BRIDGE START: env ===
+CCFO_HOST = os.getenv("CCFOLIA_BRIDGE_HOST", "127.0.0.1")
+CCFO_PORT = int(os.getenv("CCFOLIA_BRIDGE_PORT", "8800"))
+CCFO_SECRET = os.getenv("CCFOLIA_POST_SECRET", "")
+CCFO_ACCEPT_FROM = {x.strip() for x in os.getenv("CCFOLIA_ACCEPT_FROM", "127.0.0.1,::1").split(",")}
+CCFO_MIRROR_CH_ID = int(os.getenv("CCFOLIA_MIRROR_CHANNEL_ID", "0") or "0")
+CCFO_TTS_MODE = os.getenv("CCFOLIA_TTS_MODE", "file").strip().lower()  # file/voice/off
+CCFO_SPK_MAP = json.loads(os.getenv("CCFOLIA_SPEAKER_MAP_JSON", '{"（未指定）":2}'))
+CCFO_DEFAULT_SPK = int(os.getenv("CCFOLIA_DEFAULT_SPEAKER", "2"))
+# イベントキュー
+ccfo_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+# === CCFOLIA BRIDGE END: env ===
 
 # STT字幕用の基本16色（視認性の高い色を選択）
 STT_COLOR_PALETTE: list[int] = [
@@ -57,6 +73,7 @@ def _resolve_log_dir(base_dir: Path, env_value: str | None) -> Path:
 LOG_DIR = _resolve_log_dir(PROJECT_ROOT, os.getenv("LOG_DIR"))
 TTS_LOG_PATH = LOG_DIR / "tts_logs.csv"
 STT_LOG_PATH = LOG_DIR / "stt_logs.csv"
+CCFO_LOG_PATH = LOG_DIR / "ccfolia_event_logs.csv"
 _log_lock = asyncio.Lock()  # 複数タスクからの同時書き込みを保護
 print(f"[LOG] output directory: {LOG_DIR}")  # 起動時に出力先を表示
 
@@ -75,6 +92,10 @@ _ensure_csv_with_header(
 _ensure_csv_with_header(
     STT_LOG_PATH,
     ["timestamp_iso", "guild_id", "dest_channel_id", "user_id", "user_display", "text", "duration_sec", "rms", "dbfs"],
+)
+_ensure_csv_with_header(
+    CCFO_LOG_PATH,
+    ["timestamp_iso", "user_display", "text"],
 )
 
 def _norm_text_for_csv(text: str) -> str:
@@ -131,6 +152,19 @@ async def log_stt_event(
     ]
     await _append_csv(STT_LOG_PATH, row)
 
+async def log_ccfolia_event(
+    user_display: str,
+    text: str,
+):
+    print(['log:',CCFO_LOG_PATH,',',user_display,',',text])
+    """ココフォリア連携のログ（発言者・発言時間（記録時刻）付き）"""
+    ts = datetime.now(timezone.utc).isoformat()
+    row = [
+        ts,
+        user_display,
+        _norm_text_for_csv(text),
+    ]
+    await _append_csv(CCFO_LOG_PATH, row)
 
 if OPENAI_API_KEY:
     print(f"[STT] OPENAI_API_KEY detected.")
@@ -1514,7 +1548,7 @@ async def download_logs(ctx: commands.Context):
     """音声関連ログ（TTS/STT）を取得して送信する。"""
     files: list[discord.File] = []
     async with _log_lock:
-        for path in (TTS_LOG_PATH, STT_LOG_PATH):
+        for path in (TTS_LOG_PATH, STT_LOG_PATH, CCFO_LOG_PATH):
             if path.exists():
                 data = path.read_bytes()
                 buff = io.BytesIO(data)
@@ -2058,6 +2092,186 @@ async def help_command(ctx: commands.Context, *, command_name: str = None):
         emb.set_footer(text="管理者向けのコマンドも表示しています。")
 
     await ctx.reply(embed=emb)
+
+# === CCFOLIA BRIDGE START: web server & pump ===
+def _ip_allowed(remote: str) -> bool:
+    if not CCFO_ACCEPT_FROM:
+        return True
+    host = (remote or "").split(":")[0]
+    return (remote in CCFO_ACCEPT_FROM) or (host in CCFO_ACCEPT_FROM)
+
+# CORS ヘッダ（必要に応じて Origin を制限したければ "*" を "https://ccfolia.com" に）
+def _cors_headers(origin: str | None) -> dict:
+    allow_origin = origin if origin else "*"
+    return {
+        "Access-Control-Allow-Origin": allow_origin,
+        "Vary": "Origin",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-CCF-Token",
+        "Access-Control-Max-Age": "600",
+        # PNA（ローカル宛て）を許可（Chrome系）
+        "Access-Control-Allow-Private-Network": "true",
+    }
+
+async def ccfo_options_handler(request: web.Request):
+    # プリフライトへ 200 応答 + CORS ヘッダ
+    origin = request.headers.get("Origin")
+    return web.Response(status=200, headers=_cors_headers(origin))
+
+async def ccfo_post_handler(request: web.Request):
+    print('start:ccfo_post_handler') # for debug
+    origin = request.headers.get("Origin")
+    # IP/Token チェックはこれまで通り
+    if not _ip_allowed(request.remote or ""):
+        return web.json_response({"ok": False, "error": "forbidden_ip"}, status=403, headers=_cors_headers(origin))
+    token = request.headers.get("X-CCF-Token", "")
+    if CCFO_SECRET and token != CCFO_SECRET:
+        return web.json_response({"ok": False, "error": "bad_token"}, status=401, headers=_cors_headers(origin))
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400, headers=_cors_headers(origin))
+
+    spk = (data.get("speaker") or "（未指定）").strip()
+    txt = (data.get("text") or "").strip()
+    room = (data.get("room") or "").strip()
+    ts_client = (data.get("ts_client") or "").strip()
+    print(['speaker',spk]) # for debug
+    print(['text',txt]) # for debug
+    print(['room',room]) # for debug
+    print(['ts_client',ts_client]) # for debug
+    await log_ccfolia_event(user_display=spk,text=txt)
+    if not txt:
+        return web.json_response({"ok": False, "error": "empty_text"}, status=400, headers=_cors_headers(origin))
+
+    await ccfo_queue.put({"speaker": spk, "text": txt, "room": room, "ts_client": ts_client})
+    print('check:ccfo_queue') # for debug
+    print(ccfo_queue) # for debug
+    print('end:ccfo_post_handler') # for debug
+    return web.json_response({"ok": True}, headers=_cors_headers(origin))
+
+
+async def _start_ccfo_web_server():
+    app = web.Application()
+    app.add_routes([
+        web.post("/ccfolia_event", ccfo_post_handler),
+        web.options("/ccfolia_event", ccfo_options_handler),  # ← 追加
+    ])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=CCFO_HOST, port=CCFO_PORT)
+    await site.start()
+    print(f"[CCFOLIA] bridge server started at http://{CCFO_HOST}:{CCFO_PORT}")
+
+def _resolve_ccfo_speaker_id(name: str) -> int:
+    return int(CCFO_SPK_MAP.get(name, CCFO_SPK_MAP.get("（未指定）", CCFO_DEFAULT_SPK)))
+
+async def _ccfo_send_text(ch: discord.TextChannel, speaker: str, text: str, room: str, ts_client: str):
+    header = f"[{room}] {speaker}" if room else speaker
+    stamp = f" `({ts_client})`" if ts_client else ""
+    content = f"**{header}**{stamp}\n{text}"
+    print(['content',content]) # for debug
+    print(ch) # for debug
+    await ch.send(content)
+
+async def _ccfo_send_voicevox_file(ch: discord.TextChannel, speaker: str, text: str, spk_id: int):
+    # 既存の VOICEVOX 同期関数を流用
+    try:
+        wav = await _voicevox_synthesize(sanitize_for_tts(text), spk_id)
+    except Exception as e:
+        await ch.send(f"【TTS失敗:{speaker}】{e!r}")
+        return
+    bio = io.BytesIO(wav); bio.seek(0)
+    await ch.send(file=discord.File(bio, filename=f"{speaker}.wav"))
+
+async def _ccfo_play_in_vc(guild: discord.Guild, text: str, spk_id: int):
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return False
+    # 直接 VOICEVOX で合成 → 一時WAV → VC 再生
+    try:
+        wav = await _voicevox_synthesize(sanitize_for_tts(text), spk_id)
+    except Exception as e:
+        print("[CCFOLIA] VC TTS failed:", repr(e))
+        return False
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        tmp = f.name; f.write(wav)
+    try:
+        await _play_vc_audio(vc, tmp)
+        return True
+    finally:
+        try: os.remove(tmp)
+        except: pass
+
+async def ccfo_pump_worker():
+    await bot.wait_until_ready()
+    if not CCFO_MIRROR_CH_ID:
+        print("[CCFOLIA] WARNING: CCFOLIA_MIRROR_CHANNEL_ID is not set; events will be dropped.")
+    print(['CCFO_MIRROR_CH_ID:',CCFO_MIRROR_CH_ID]) # for debug
+    text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
+
+    while True:
+        ev = await ccfo_queue.get()
+        print('check:ccfo_queue') # for debug
+        print(ccfo_queue) # for debug
+        sp = ev.get("speaker") or "（未指定）"
+        tx = ev.get("text") or ""
+        room = ev.get("room") or ""
+        ts_client = ev.get("ts_client") or ""
+        spk_id = _resolve_ccfo_speaker_id(sp)
+        
+        if not text_ch:
+            text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
+
+        print(['speaker',sp]) # for debug
+        print(['text',tx]) # for debug
+        print(['room',room]) # for debug
+        print(['ts_client',ts_client]) # for debug
+        print(['spk_id',spk_id]) # for debug
+        print(['text_ch',text_ch]) # for debug
+
+        # 1) テキストミラー
+        if isinstance(text_ch, discord.TextChannel):
+            print(['ccfolia event send to discord :text:',sp,',',tx]) # for debug
+            await _ccfo_send_text(text_ch, sp, tx, room, ts_client)
+
+        # 2) TTS
+        if CCFO_TTS_MODE == "file":
+            if isinstance(text_ch, discord.TextChannel):
+                await _ccfo_send_voicevox_file(text_ch, sp, tx, spk_id)
+        elif CCFO_TTS_MODE == "voice":
+            ## 未指定は読み上げない。
+            #if sp == "（未指定）":
+            #    break
+            # 最初のギルドに対して VC 再生を試みる（必要なら env で GUILD 固定も可）
+            guilds = bot.guilds
+            ok = False
+            for g in guilds:
+                ok = await _ccfo_play_in_vc(g, f"{sp}：{tx}", spk_id)
+                if ok:
+                    break
+            if not ok and isinstance(text_ch, discord.TextChannel):
+                await text_ch.send("（VC未接続のためTTSは再生できませんでした）")
+
+# 起動時に webサーバ と ポンプを起動
+_original_on_ready = bot.on_ready
+
+@bot.event
+async def on_ready():
+    # 既存の on_ready ロジックを維持
+    if _original_on_ready:
+        try:
+            await _original_on_ready()
+        except TypeError:
+            # 既存が同期関数の可能性にも一応配慮
+            pass
+    # 一度だけ起動
+    if not getattr(bot, "_ccfo_server_started", False):
+        bot._ccfo_server_started = True
+        bot.loop.create_task(_start_ccfo_web_server())
+        bot.loop.create_task(ccfo_pump_worker())
+        print("[CCFOLIA] pump & server tasks started")
+# === CCFOLIA BRIDGE END ===
 
 
 def main() -> None:
