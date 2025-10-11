@@ -92,8 +92,8 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
    - 読み上げ音声種類一覧の表示: `!voicevoxstyles`
 
 4. **音声文字起こし (字幕)**
-   - 開始: `!stton`（デフォルト 10 秒ごとに区切って文字起こし）
-   - 例: `!stton 8`（8 秒ごとに区切る）
+   - 開始: `!stton`（既定は VAD による自動区切り）
+   - 固定区切りに切り替え: `!stton fixed 8`（8 秒ごとに強制区切り）
    - 停止: `!sttoff`
 
 5. **音声文字起こしの色の指定**
@@ -117,9 +117,9 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 - `!readhere` … 読み上げ対象のテキストチャンネルを“今ここ”に変更します。例: `!readhere`
 
 ### 文字起こし（STT）
-- `!stton [3-60]` … 指定秒数ごとに文字起こしを開始します。例: `!stton 8`
+- `!stton [vad|fixed] [3-60]` … 文字起こしを開始します。例: `!stton`, `!stton fixed 8`
 - `!sttoff` … 文字起こしを停止します。例: `!sttoff`
-- `!sttset ...` … STT 設定を調整します。例: `!sttset vad 0.008`, `!sttset lang auto`
+- `!sttset ...` … STT 設定を調整します。例: `!sttset vad 0.008`, `!sttset vadlevel 3`
 - `!sttcolor ...` … 字幕カラーを管理します。例: `!sttcolor @自分 3`
 - `!sttpalette` … 字幕カラーのパレットをプレビューします。例: `!sttpalette`
 

@@ -1,4 +1,6 @@
 import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time,csv, json
+import audioop
+import collections
 import discord
 import typing as T
 
@@ -11,6 +13,11 @@ from gtts import gTTS
 from openai import OpenAI
 from pathlib import Path
 import requests
+
+try:
+    import webrtcvad
+except ImportError:  # pragma: no cover - optional dependency guard
+    webrtcvad = None
 
 # === CCFOLIA BRIDGE START: import ===
 from aiohttp import web
@@ -445,6 +452,189 @@ def wav_stats(src):
         if need_close:
             f.close()
 
+
+def _wav_bytes_to_pcm16k(src: bytes) -> bytes | None:
+    """WaveSinkが生成したWAVを16kHz/mono/16bit PCMへ変換する。"""
+    try:
+        with wave.open(io.BytesIO(src), "rb") as wf:
+            rate = wf.getframerate()
+            width = wf.getsampwidth()
+            channels = wf.getnchannels()
+            frames = wf.readframes(wf.getnframes())
+    except Exception:
+        traceback.print_exc()
+        return None
+
+    if not frames:
+        return None
+
+    try:
+        if channels > 1:
+            frames = audioop.tomono(frames, width, 1.0, 1.0)
+        if width != 2:
+            frames = audioop.lin2lin(frames, width, 2)
+            width = 2
+        if rate != 16000:
+            frames, _ = audioop.ratecv(frames, 2, 1, rate, 16000, None)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+    return frames
+
+
+def _pcm16k_to_wav_bytes(pcm: bytes, sample_rate: int = 16000) -> bytes:
+    buff = io.BytesIO()
+    with wave.open(buff, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buff.getvalue()
+
+
+class _VadUserStream:
+    """ユーザー単位で音声フレームを受け取り、VAD区切りを行う。"""
+
+    FRAME_MS = 20
+    SAMPLE_RATE = 16000
+    SAMPLE_WIDTH = 2
+
+    def __init__(self):
+        self._vad: webrtcvad.Vad | None = None if webrtcvad is None else webrtcvad.Vad(2)
+        self._config: dict[str, int] = {}
+        self._pre_buffer: collections.deque[bytes] = collections.deque()
+        self._active: list[bytes] = []
+        self._prev_tail: list[bytes] = []
+        self._in_speech = False
+        self._silence_counter = 0
+        self._post_counter = -1
+        self._silence_frames = 8
+        self._post_frames = 0
+        self._overlap_frames = 0
+        self._max_segment_frames = 1200
+        self._min_frames = 1
+
+    def configure(self, st: dict):
+        if webrtcvad is None:
+            raise RuntimeError("webrtcvad is not available")
+
+        cfg = dict(
+            aggressiveness=int(max(0, min(3, st.get("vad_aggressiveness", 2))))
+        )
+        frame_ms = self.FRAME_MS
+        cfg["pre_frames"] = max(0, int(st.get("vad_pre_ms", 200) // frame_ms))
+        cfg["silence_frames"] = max(1, int(st.get("vad_silence_ms", 450) // frame_ms))
+        cfg["post_frames"] = max(0, int(st.get("vad_post_ms", 400) // frame_ms))
+        cfg["overlap_frames"] = max(0, int(st.get("vad_overlap_ms", 320) // frame_ms))
+        cfg["min_frames"] = max(1, int(st.get("min_dur", 0.8) * 1000 // frame_ms))
+        cfg["max_segment_frames"] = max(
+            cfg["overlap_frames"] + cfg["silence_frames"] + 1,
+            int(st.get("vad_max_segment_ms", 20000) // frame_ms)
+        )
+
+        if cfg != self._config:
+            self._config = cfg
+            self._vad = webrtcvad.Vad(cfg["aggressiveness"])
+            self._pre_buffer = collections.deque(maxlen=cfg["pre_frames"] or 1)
+            self._silence_frames = cfg["silence_frames"]
+            self._post_frames = cfg["post_frames"]
+            self._overlap_frames = cfg["overlap_frames"]
+            self._max_segment_frames = max(cfg["max_segment_frames"], cfg["pre_frames"] + cfg["overlap_frames"] + 4)
+            self._min_frames = cfg["min_frames"]
+
+    def feed(self, wav_bytes: bytes, st: dict) -> list[bytes]:
+        if webrtcvad is None:
+            return []
+        self.configure(st)
+        pcm = _wav_bytes_to_pcm16k(wav_bytes)
+        if not pcm:
+            return []
+
+        frame_bytes = int(self.SAMPLE_RATE * self.FRAME_MS / 1000) * self.SAMPLE_WIDTH
+        outputs: list[bytes] = []
+
+        for offset in range(0, len(pcm), frame_bytes):
+            frame = pcm[offset:offset + frame_bytes]
+            if len(frame) < frame_bytes:
+                # 端数は次サイクルへ回す（捨てる）
+                break
+
+            is_speech = self._vad.is_speech(frame, self.SAMPLE_RATE) if self._vad else False
+
+            if is_speech:
+                if not self._in_speech:
+                    starter: list[bytes] = []
+                    if self._prev_tail and self._overlap_frames:
+                        starter.extend(self._prev_tail)
+                    if self._config.get("pre_frames"):
+                        starter.extend(self._pre_buffer)
+                    if starter:
+                        self._active.extend(starter)
+                    self._prev_tail = []
+                    self._in_speech = True
+                self._active.append(frame)
+                self._silence_counter = 0
+                self._post_counter = -1
+            else:
+                if self._in_speech:
+                    self._active.append(frame)
+                    self._silence_counter += 1
+                    if self._silence_counter >= self._silence_frames:
+                        if self._post_counter < 0:
+                            self._post_counter = self._post_frames
+                        self._post_counter -= 1
+                        if self._post_counter <= 0:
+                            seg = self._finalize_segment()
+                            if seg:
+                                outputs.append(_pcm16k_to_wav_bytes(seg))
+                # サイレント状態が続く場合もプリバッファには保持する
+
+            # プリロール用リングバッファは常に最新状態に更新
+            if self._pre_buffer.maxlen:
+                self._pre_buffer.append(frame)
+
+            if self._in_speech and len(self._active) >= self._max_segment_frames:
+                seg = self._finalize_segment(force=True)
+                if seg:
+                    outputs.append(_pcm16k_to_wav_bytes(seg))
+
+        return outputs
+
+    def drain(self) -> list[bytes]:
+        if not self._active:
+            return []
+        seg = self._finalize_segment(force=True)
+        if not seg:
+            return []
+        return [_pcm16k_to_wav_bytes(seg)]
+
+    def _finalize_segment(self, force: bool = False) -> bytes | None:
+        if not self._active:
+            self._reset_state()
+            return None
+        segment_frames = list(self._active)
+        if not force and len(segment_frames) < self._min_frames:
+            # 短すぎるセグメントはノイズとして破棄
+            self._reset_state()
+            return None
+
+        tail_count = min(self._overlap_frames, len(segment_frames))
+        if tail_count:
+            self._prev_tail = segment_frames[-tail_count:]
+        else:
+            self._prev_tail = []
+
+        pcm = b"".join(segment_frames)
+        self._reset_state()
+        return pcm
+
+    def _reset_state(self):
+        self._active = []
+        self._in_speech = False
+        self._silence_counter = 0
+        self._post_counter = -1
+
 async def transcribe_and_post(src, channel, username: str):
     if not openai:
         print("[STT] OpenAI client is None"); return
@@ -587,8 +777,17 @@ def get_state(guild_id):
             record_window=DEFAULT_WINDOW,
             stt_task=None,
             vad_rms=0.02,
+            vad_db=-45.0,
             min_dur=0.8,
             merge_window=6.0,
+            merge_auto=True,
+            stt_mode="vad",  # vad | fixed
+            vad_aggressiveness=2,
+            vad_silence_ms=450,
+            vad_pre_ms=200,
+            vad_post_ms=400,
+            vad_overlap_ms=320,
+            vad_max_segment_ms=20000,
             lang="ja",
             use_thread=False,
             caption_dest_id=None,
@@ -1020,16 +1219,42 @@ async def readoff(ctx: commands.Context):
     await ctx.reply("読み上げを停止しました。")
 
 @bot.command(name="stton", aliases=["字幕開始","文字起こし開始","字幕オン","音声認識開始"])
-async def stton(ctx: commands.Context, window: int | None = None):
+async def stton(ctx: commands.Context, *args: str):
     vc = ctx.guild.voice_client
     if not vc or not vc.is_connected():
         return await ctx.reply("先に `!join` してください。")
     st = get_state(ctx.guild.id)
-    if window and 3 <= window <= 60:
-        st["record_window"] = window
+
+    desired_mode = st.get("stt_mode", "vad")
+    window_override: int | None = None
+
+    for raw in args:
+        if raw is None:
+            continue
+        token = raw.strip()
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered in ("vad", "auto", "adaptive"):
+            desired_mode = "vad"
+        elif lowered in ("fixed", "timer", "window", "legacy"):
+            desired_mode = "fixed"
+        else:
+            try:
+                win = int(token)
+            except ValueError:
+                return await ctx.reply("`vad` / `fixed` / 区切り秒数(3-60) のいずれかで指定してください。")
+            if not (3 <= win <= 60):
+                return await ctx.reply("区切り秒数は 3〜60 の範囲で指定してください。")
+            window_override = win
+            desired_mode = "fixed"
+
+    if window_override is not None:
+        st["record_window"] = window_override
         if st.get("merge_auto", True):
-            # 認識窓より少し長く（1.25倍 + 余裕）
-            st["merge_window"] = max(st["merge_window"], round(window * 1.25, 2))
+            st["merge_window"] = max(st["merge_window"], round(window_override * 1.25, 2))
+
+    st["stt_mode"] = desired_mode
 
     # 既存タスク停止
     if st.get("stt_task") and not st["stt_task"].done():
@@ -1047,7 +1272,11 @@ async def stton(ctx: commands.Context, window: int | None = None):
     # ワーカーには “解決済みの送信先ID” を渡す
     st["stt_task"] = asyncio.create_task(stt_worker(ctx.guild.id, dest.id))
     st["stt_on"] = True
-    await ctx.reply(f"🎧 音声認識を開始（{st['record_window']}秒区切り）。投稿先: <#{dest.id}> / OpenAI鍵: {'あり' if openai else 'なし'}")
+
+    mode_text = "VADモード" if desired_mode == "vad" else f"固定{st['record_window']}秒区切り"
+    await ctx.reply(
+        f"🎧 音声認識を開始（{mode_text}）。投稿先: <#{dest.id}> / OpenAI鍵: {'あり' if openai else 'なし'}"
+    )
 
 
 @bot.command(name="sttoff", aliases=["字幕停止","字幕終了","文字起こし停止","字幕オフ","音声認識停止"])
@@ -1574,8 +1803,11 @@ async def sttset(ctx, key: str=None, value: str=None):
     st = get_state(ctx.guild.id)
     if not key:
         return await ctx.reply(
-            ("設定: vad={vad_rms} vaddb={vad_db} mindur={min_dur}s "
-             "merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread}").format(**st)
+            (
+                "設定: mode={stt_mode} window={record_window}s vad={vad_rms} vaddb={vad_db} "
+                "mindur={min_dur}s merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread} "
+                "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms"
+            ).format(**st)
         )
 
     try:
@@ -1595,14 +1827,43 @@ async def sttset(ctx, key: str=None, value: str=None):
         elif k in ("thread","th"):
             st["use_thread"] = (value.lower() in ("on","true","1","yes","y"))
             st["caption_dest_id"] = None
+        elif k in ("mode", "sttmode"):
+            lv = value.lower()
+            if lv not in ("vad", "fixed"):
+                return await ctx.reply("mode は `vad` または `fixed` を指定してください。")
+            st["stt_mode"] = lv
+        elif k in ("window", "win"):
+            win = int(value)
+            if not (3 <= win <= 60):
+                return await ctx.reply("window は 3〜60 の整数で指定してください。")
+            st["record_window"] = win
+        elif k in ("vadlevel", "vadmode", "vadaggr"):
+            lvl = int(value)
+            if not (0 <= lvl <= 3):
+                return await ctx.reply("vadlevel は 0〜3 の整数で指定してください。")
+            st["vad_aggressiveness"] = lvl
+        elif k in ("vadsilence", "silence"):
+            st["vad_silence_ms"] = max(120, min(2000, int(value)))
+        elif k in ("vadpre", "pre"):
+            st["vad_pre_ms"] = max(0, min(1000, int(value)))
+        elif k in ("vadpost", "post"):
+            st["vad_post_ms"] = max(0, min(1500, int(value)))
+        elif k in ("vadoverlap", "overlap"):
+            st["vad_overlap_ms"] = max(0, min(1000, int(value)))
         else:
-            return await ctx.reply("未知のキー: vad / vaddb / mindur / merge / mergeauto / lang / thread")
+            return await ctx.reply(
+                "未知のキー: vad / vaddb / mindur / merge / mergeauto / lang / thread / "
+                "mode / window / vadlevel / vadsilence / vadpre / vadpost / vadoverlap"
+            )
     except Exception as e:
         return await ctx.reply(f"設定失敗: {e!r}")
 
     await ctx.reply(
-        ("OK: vad={vad_rms} vaddb={vad_db} mindur={min_dur}s "
-         "merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread}").format(**st)
+        (
+            "OK: mode={stt_mode} window={record_window}s vad={vad_rms} vaddb={vad_db} "
+            "mindur={min_dur}s merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread} "
+            "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms"
+        ).format(**st)
     )
 
 
@@ -1612,6 +1873,9 @@ async def stt_worker(guild_id: int, channel_id: int):
         return
     print("[STT] worker start", guild_id, channel_id)
     st = get_state(guild_id)
+    vad_streams: dict[int, _VadUserStream] = {}
+    vad_last_seen: dict[int, float] = {}
+    warned_vad_missing = False
 
     try:
         while True:
@@ -1703,7 +1967,9 @@ async def stt_worker(guild_id: int, channel_id: int):
                     await asyncio.sleep(1.0)
                     continue
 
-                window = st["record_window"]
+                window = float(st.get("record_window", DEFAULT_WINDOW))
+                if window < 1.0:
+                    window = 1.0
                 await asyncio.sleep(window)
 
                 # 停止（同期）
@@ -1718,13 +1984,67 @@ async def stt_worker(guild_id: int, channel_id: int):
 
             # ここまでが1サイクル（ロック解放）
 
+            mode = st.get("stt_mode", "vad")
+            use_vad = mode == "vad" and webrtcvad is not None
+            now_ts = time.time()
+
+            if mode == "vad" and webrtcvad is None and not warned_vad_missing:
+                print("[STT] webrtcvad is not available; falling back to fixed segmentation")
+                warned_vad_missing = True
+
+            jobs: list[T.Awaitable] = []
+            if use_vad:
+                captured_users: set[int] = set()
+                for (uid, data, buf) in captured:
+                    captured_users.add(uid)
+                    stream = vad_streams.get(uid)
+                    if stream is None:
+                        stream = _VadUserStream()
+                        vad_streams[uid] = stream
+                    vad_last_seen[uid] = now_ts
+                    name = await resolve_display_name(guild_obj, uid, data)
+                    segments = stream.feed(buf, st)
+                    for segment_wav in segments:
+                        jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, segment_wav, dest))
+
+                silence_sec = (st.get("vad_silence_ms", 450) + st.get("vad_post_ms", 400)) / 1000.0
+                idle_threshold = max(st.get("record_window", DEFAULT_WINDOW), silence_sec + 0.5)
+
+                for uid in list(vad_streams.keys()):
+                    if uid in captured_users:
+                        continue
+                    last_seen = vad_last_seen.get(uid, 0.0)
+                    if (now_ts - last_seen) > idle_threshold:
+                        name = await resolve_display_name(guild_obj, uid, None)
+                        drained = vad_streams[uid].drain()
+                        if drained:
+                            for segment_wav in drained:
+                                jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, segment_wav, dest))
+                        vad_streams.pop(uid, None)
+                        vad_last_seen.pop(uid, None)
+
+                if jobs:
+                    await asyncio.gather(*jobs, return_exceptions=True)
+                elif not captured:
+                    print("[STT] no audio captured in this window (VAD mode)")
+                    await asyncio.sleep(0.3)
+                continue
+
             if not captured:
                 print("[STT] no audio captured in this window")
                 await asyncio.sleep(0.3)
                 continue
 
-            # Whisper へ
-            jobs = []
+            # VADを通さない固定区切りモード
+            if vad_streams:
+                for uid, stream in list(vad_streams.items()):
+                    name = await resolve_display_name(guild_obj, uid, None)
+                    drained = stream.drain()
+                    for segment_wav in drained:
+                        jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, segment_wav, dest))
+                vad_streams.clear()
+                vad_last_seen.clear()
+
             for (uid, data, buf) in captured:
                 name = await resolve_display_name(guild_obj, uid, data)
                 jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, buf, dest))
@@ -1744,6 +2064,19 @@ async def stt_worker(guild_id: int, channel_id: int):
         if vc and vc.is_connected():
             await ensure_stopped(vc, "on crash")
     finally:
+        if vad_streams:
+            flush_dest = await resolve_message_channel(channel_id, guild_id)
+            if flush_dest:
+                flush_jobs = []
+                for uid, stream in list(vad_streams.items()):
+                    drained = stream.drain()
+                    if not drained:
+                        continue
+                    name = await resolve_display_name(guild_obj, uid, None)
+                    for segment_wav in drained:
+                        flush_jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, segment_wav, flush_dest))
+                if flush_jobs:
+                    await asyncio.gather(*flush_jobs, return_exceptions=True)
         print("[STT] worker end", guild_id)
 
 @bot.command(name="intentcheck")
@@ -1922,8 +2255,8 @@ _HELP_ITEMS = [
     },
     {
         "name": "stton", "aliases": ["字幕開始","文字起こし開始","字幕オン","音声認識開始"],
-        "usage": "{p}stton [区切り秒数(3-60)]",
-        "desc": "ボイスチャンネルの音声を区切って文字起こしし、ここ（またはスレッド）に投稿します。例: `{p}stton 8`",
+        "usage": "{p}stton [vad|fixed] [区切り秒数(3-60)]",
+        "desc": "ボイスチャンネルの音声を文字起こしします。既定はVADモード。例: `{p}stton`, `{p}stton fixed 8`",
     },
     {
         "name": "sttoff", "aliases": ["字幕停止","文字起こし停止","字幕オフ","音声認識停止"],
@@ -1958,12 +2291,12 @@ _HELP_ITEMS = [
     {
         "name": "sttset", "aliases": [],
         "usage": (
-            "{p}sttset vad <rms> | vaddb <dB> | mindur <秒> | merge <秒> | "
-            "mergeauto on/off | lang <auto/ja/en> | thread on/off"
+            "{p}sttset <key> <value> / key: vad | vaddb | mindur | merge | mergeauto | lang | thread | "
+            "mode | window | vadlevel | vadsilence | vadpre | vadpost | vadoverlap"
         ),
         "desc": (
-            "VADしきい値・最小長・マージ時間・言語・スレッド運用などを調整します。"
-            " 例: `{p}sttset vad 0.008`, `{p}sttset lang auto`, `{p}sttset thread on`"
+            "VADしきい値やタイマー区切りなど認識設定を調整します。"
+            " 例: `{p}sttset vad 0.008`, `{p}sttset vadlevel 3`, `{p}sttset mode fixed`"
         ),
     },
     {
