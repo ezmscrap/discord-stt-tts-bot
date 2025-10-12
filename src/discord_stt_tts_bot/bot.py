@@ -966,6 +966,46 @@ def _apply_gain_and_gate(wav_bytes: bytes, st: dict) -> tuple[bytes, dict | None
     return wav_bytes, info
 
 
+def _append_pcm_buffer(st: dict, user_id: int, pcm_bytes: bytes) -> list[bytes]:
+    buffers: dict[int, bytearray] = st.setdefault("pcm_buffers", {})
+    entry = buffers.setdefault(int(user_id), bytearray())
+    entry.extend(pcm_bytes)
+
+    max_sec = float(st.get("buffer_max_sec", 20.0))
+    max_samples = int(max(1.0, max_sec) * 16000)
+    if len(entry) > max_samples * 2:
+        entry[:] = entry[-max_samples * 2:]
+
+    last_seen: dict[int, float] = st.setdefault("pcm_last_seen", {})
+    last_seen[int(user_id)] = time.time()
+
+    min_sec = max(0.2, float(st.get("min_dur", 0.8)))
+    min_samples = int(min_sec * 16000)
+    segments: list[bytes] = []
+    if len(entry) >= min_samples * 2:
+        segments.append(bytes(entry))
+        entry.clear()
+    return segments
+
+
+def _flush_stale_pcm_buffers(st: dict, captured_users: set[int]) -> list[tuple[int, bytes]]:
+    now = time.time()
+    last_seen: dict[int, float] = st.get("pcm_last_seen") or {}
+    buffers: dict[int, bytearray] = st.get("pcm_buffers") or {}
+    flush_sec = max(0.6, float(st.get("record_window", DEFAULT_WINDOW)))
+    outputs: list[tuple[int, bytes]] = []
+    for uid, ts in list(last_seen.items()):
+        if uid in captured_users:
+            continue
+        if now - ts >= flush_sec:
+            data = buffers.get(uid)
+            if data:
+                outputs.append((uid, bytes(data)))
+                data.clear()
+            last_seen.pop(uid, None)
+    return outputs
+
+
 async def transcribe_and_post(src, channel, username: str):
     if not openai:
         print("[STT] OpenAI client is None"); return
@@ -1156,6 +1196,8 @@ def get_state(guild_id):
                 gain_factor_sum=0.0,
                 gate_frames=0,
             ),
+            pcm_buffers={},
+            pcm_last_seen={},
         )
     return guild_state[guild_id]
 
@@ -2483,11 +2525,6 @@ async def stt_worker(guild_id: int, channel_id: int):
                     await asyncio.sleep(0.3)
                 continue
 
-            if not captured:
-                print("[STT] no audio captured in this window")
-                await asyncio.sleep(0.3)
-                continue
-
             # VADを通さない固定区切りモード
             if vad_streams:
                 for uid, stream in list(vad_streams.items()):
@@ -2498,9 +2535,28 @@ async def stt_worker(guild_id: int, channel_id: int):
                 vad_streams.clear()
                 vad_last_seen.clear()
 
+            captured_users: set[int] = set()
             for (uid, data, buf) in captured:
+                captured_users.add(uid)
                 name = await resolve_display_name(guild_obj, uid, data)
-                jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, buf, dest))
+                pcm = _wav_bytes_to_pcm16k(buf)
+                if not pcm:
+                    continue
+                for segment_pcm in _append_pcm_buffer(st, uid, pcm):
+                    wav_seg = _pcm16k_to_wav_bytes(segment_pcm)
+                    jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, wav_seg, dest))
+
+            stale_segments = _flush_stale_pcm_buffers(st, captured_users)
+            for uid, pcm_segment in stale_segments:
+                name = await resolve_display_name(guild_obj, uid, None)
+                wav_segment = _pcm16k_to_wav_bytes(pcm_segment)
+                jobs.append(transcribe_and_post_from_bytes(guild_id, uid, name, wav_segment, dest))
+
+            if not jobs:
+                print("[STT] no audio captured in this window")
+                await asyncio.sleep(0.3)
+                continue
+
             await asyncio.gather(*jobs, return_exceptions=True)
 
     except asyncio.CancelledError:
