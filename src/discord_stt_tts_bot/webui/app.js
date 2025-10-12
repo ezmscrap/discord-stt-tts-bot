@@ -17,7 +17,18 @@ const TOKEN_STORAGE_KEY = "discord-sttts-gui-token";
  *   config: GuiConfig|null|undefined,
  *   requiresToken: boolean,
  *   loading: boolean,
- *   error: string
+ *   error: string,
+ *   users: Array<any>,
+ *   userLoading: boolean,
+ *   userError: string,
+ *   userMessage: string,
+ *   userQuery: string,
+ *   userTotal: number,
+ *   speakers: Array<any>,
+ *   speakerLoading: boolean,
+ *   speakerError: string,
+ *   speakerQuery: string,
+ *   speakerTotal: number
  * }}
  */
 const state = {
@@ -32,6 +43,11 @@ const state = {
   userMessage: "",
   userQuery: "",
   userTotal: 0,
+  speakers: [],
+  speakerLoading: false,
+  speakerError: "",
+  speakerQuery: "",
+  speakerTotal: 0,
 };
 
 /**
@@ -49,6 +65,13 @@ function handleUnauthorized(message) {
   state.userLoading = false;
   state.userError = "";
   state.userMessage = "";
+  state.userQuery = "";
+  state.userTotal = 0;
+  state.speakers = [];
+  state.speakerLoading = false;
+  state.speakerError = "";
+  state.speakerQuery = "";
+  state.speakerTotal = 0;
   state.loading = false;
   render();
 }
@@ -142,6 +165,13 @@ async function loadConfig(options = {}) {
   }
   if (success && options.reloadUsers !== false) {
     await loadUsers({ refresh: true });
+  }
+  if (success && state.config?.provider === "voicevox") {
+    await loadSpeakers({ refresh: true });
+  } else {
+    state.speakers = [];
+    state.speakerQuery = "";
+    state.speakerTotal = 0;
   }
   return success;
 }
@@ -324,6 +354,10 @@ function renderHeader() {
     state.userMessage = "";
     state.userQuery = "";
     state.userTotal = 0;
+    state.speakers = [];
+    state.speakerError = "";
+    state.speakerQuery = "";
+    state.speakerTotal = 0;
     render();
   });
 
@@ -612,6 +646,20 @@ function createBadge(text, variant) {
 }
 
 /**
+ * 話者 ID から表示名を解決する。
+ * @param {number} speakerId 話者 ID。
+ * @returns {string} 表示名。
+ */
+function speakerNameById(speakerId) {
+  const targetId = Number.parseInt(speakerId, 10);
+  if (Number.isNaN(targetId)) {
+    return `ID ${speakerId}`;
+  }
+  const speaker = state.speakers.find((item) => item.speaker_id === targetId);
+  return speaker ? speaker.speaker_name || `ID ${targetId}` : `ID ${targetId}`;
+}
+
+/**
  * gTTS 個別設定フォームを生成する。
  * @param {any} user 対象ユーザ情報。
  * @param {Array<number>} candidateIds 候補となるユーザID一覧。
@@ -738,18 +786,154 @@ function createVoicevoxControl(user, candidateIds) {
   const container = document.createElement("div");
   container.className = "user-card__control";
 
-  const note = document.createElement("div");
-  note.className = "notice";
-  const entries = Object.entries(user.voicevox_speakers || {});
-  if (entries.length) {
-    const mappings = entries.map(([id, speaker]) => `${id} → ${speaker}`).join(", ");
-    note.textContent = `現在の話者ID: ${mappings}`;
-  } else if (candidateIds.length) {
-    note.textContent = "VOICEVOX 話者設定はまだありません。話者リストの読み込み後に設定できます。";
-  } else {
-    note.textContent = "VOICEVOX の個別設定を行うにはログでユーザIDを取得してください。";
+  if (!candidateIds.length) {
+    const note = document.createElement("div");
+    note.className = "alert";
+    note.textContent = "適用可能なユーザIDが見つかりません。ログ取得後に再度お試しください。";
+    container.appendChild(note);
+    return container;
   }
-  container.appendChild(note);
+
+  if (state.speakerLoading) {
+    const note = document.createElement("div");
+    note.className = "notice";
+    note.textContent = "VOICEVOX の話者リストを読み込み中です。";
+    container.appendChild(note);
+    return container;
+  }
+
+  if (!state.speakers.length) {
+    const note = document.createElement("div");
+    note.className = "notice";
+    note.textContent = "話者リストが取得できていません。右側のパネルで再取得を実行してください。";
+    container.appendChild(note);
+    return container;
+  }
+
+  const form = document.createElement("form");
+  form.className = "voicevox-form";
+
+  const userLabel = document.createElement("label");
+  userLabel.textContent = "対象ユーザ ID";
+  const userSelect = document.createElement("select");
+  userSelect.name = "user-id";
+  for (const id of candidateIds) {
+    const option = document.createElement("option");
+    option.value = String(id);
+    option.textContent = String(id);
+    userSelect.appendChild(option);
+  }
+  userLabel.appendChild(userSelect);
+
+  const speakerLabel = document.createElement("label");
+  speakerLabel.textContent = "話者";
+  const speakerSelect = document.createElement("select");
+  speakerSelect.name = "speaker-id";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "話者を選択してください";
+  speakerSelect.appendChild(placeholder);
+  for (const speaker of state.speakers) {
+    const option = document.createElement("option");
+    option.value = String(speaker.speaker_id);
+    option.textContent = speaker.speaker_name || `ID ${speaker.speaker_id}`;
+    speakerSelect.appendChild(option);
+  }
+  speakerLabel.appendChild(speakerSelect);
+
+  const actions = document.createElement("div");
+  actions.className = "voicevox-form__actions";
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "button-primary";
+  submit.textContent = "保存";
+  const resetButton = document.createElement("button");
+  resetButton.type = "button";
+  resetButton.className = "button-secondary";
+  resetButton.textContent = "リセット";
+  actions.append(submit, resetButton);
+
+  form.append(userLabel, speakerLabel, actions);
+
+  const currentInfo = document.createElement("div");
+  currentInfo.className = "user-card__current-speaker";
+
+  const selectionHint = document.createElement("div");
+  selectionHint.className = "user-card__selection-hint";
+
+  const syncCurrent = () => {
+    const currentMapping = user.voicevox_speakers?.[userSelect.value];
+    if (currentMapping !== undefined && currentMapping !== null) {
+      const parsed = Number.parseInt(currentMapping, 10);
+      const value = String(currentMapping);
+      if (!Array.from(speakerSelect.options).some((opt) => opt.value === value)) {
+        const missingOption = document.createElement("option");
+        missingOption.value = value;
+        missingOption.textContent = `${speakerNameById(parsed)} (ID: ${value})`;
+        speakerSelect.appendChild(missingOption);
+      }
+      speakerSelect.value = value;
+      currentInfo.textContent = `現在: ${speakerNameById(parsed)} (ID: ${parsed})`;
+      selectionHint.textContent = "";
+    } else {
+      speakerSelect.value = "";
+      const defaultId = state.config?.default_voicevox_speaker;
+      const defaultName =
+        typeof defaultId === "number" ? speakerNameById(defaultId) : "未設定";
+      if (typeof defaultId === "number") {
+        currentInfo.textContent = `現在: デフォルト (${defaultId}) / ${defaultName}`;
+      } else {
+        currentInfo.textContent = "現在: デフォルト話者 (未設定)";
+      }
+      selectionHint.textContent = "";
+    }
+  };
+
+  syncCurrent();
+
+  userSelect.addEventListener("change", () => {
+    syncCurrent();
+  });
+
+  speakerSelect.addEventListener("change", () => {
+    if (!speakerSelect.value) {
+      selectionHint.textContent = "選択中: なし";
+      return;
+    }
+    const speakerId = Number.parseInt(speakerSelect.value, 10);
+    selectionHint.textContent = `選択中: ${speakerNameById(speakerId)} (ID: ${speakerId})`;
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const userId = Number.parseInt(userSelect.value, 10);
+    const speakerId = Number.parseInt(speakerSelect.value, 10);
+    if (Number.isNaN(userId)) {
+      state.userError = "ユーザIDを正しく選択してください。";
+      render();
+      return;
+    }
+    if (Number.isNaN(speakerId)) {
+      state.userError = "設定する話者を選択してください。";
+      render();
+      return;
+    }
+    state.userMessage = "VOICEVOX 話者を保存中...";
+    render();
+    await handleVoicevoxSubmit(userId, speakerId);
+  });
+
+  resetButton.addEventListener("click", async () => {
+    const userId = Number.parseInt(userSelect.value, 10);
+    if (Number.isNaN(userId)) {
+      return;
+    }
+    state.userMessage = "VOICEVOX 話者をリセット中...";
+    render();
+    await handleVoicevoxReset(userId);
+  });
+
+  container.append(form, currentInfo, selectionHint);
   return container;
 }
 
@@ -822,6 +1006,77 @@ async function handleGttsReset(userId) {
 }
 
 /**
+ * VOICEVOX 話者設定の保存を実行する。
+ * @param {number} userId 対象ユーザID。
+ * @param {number} speakerId 設定する話者ID。
+ * @returns {Promise<void>}
+ */
+async function handleVoicevoxSubmit(userId, speakerId) {
+  if (!state.config) {
+    return;
+  }
+  try {
+    const response = await apiFetch(
+      `/api/gui/voicevox/${state.config.guild_id}/${userId}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ speaker_id: speakerId }),
+      },
+    );
+    if (response.status === 401) {
+      handleUnauthorized("認証が無効になりました。再度トークンを入力してください。");
+      return;
+    }
+    if (!response.ok) {
+      state.userError = await extractErrorMessage(response);
+      state.userMessage = "";
+      render();
+      return;
+    }
+    state.userMessage = `VOICEVOX 話者を設定しました (${speakerNameById(speakerId)})。`;
+    await loadUsers({ refresh: true, clearMessage: false });
+  } catch (error) {
+    state.userError = error instanceof Error ? error.message : String(error);
+    state.userMessage = "";
+    render();
+  }
+}
+
+/**
+ * VOICEVOX 話者設定のリセットを実行する。
+ * @param {number} userId 対象ユーザID。
+ * @returns {Promise<void>}
+ */
+async function handleVoicevoxReset(userId) {
+  if (!state.config) {
+    return;
+  }
+  try {
+    const response = await apiFetch(
+      `/api/gui/voicevox/${state.config.guild_id}/${userId}`,
+      { method: "DELETE" },
+    );
+    if (response.status === 401) {
+      handleUnauthorized("認証が無効になりました。再度トークンを入力してください。");
+      return;
+    }
+    if (!response.ok) {
+      state.userError = await extractErrorMessage(response);
+      state.userMessage = "";
+      render();
+      return;
+    }
+    state.userMessage = "VOICEVOX 話者設定をリセットしました。";
+    await loadUsers({ refresh: true, clearMessage: false });
+  } catch (error) {
+    state.userError = error instanceof Error ? error.message : String(error);
+    state.userMessage = "";
+    render();
+  }
+}
+
+/**
  * API レスポンスからエラーメッセージを抽出する。
  * @param {Response} response フェッチレスポンス。
  * @returns {Promise<string>} エラーメッセージ。
@@ -859,16 +1114,183 @@ function renderSpeakerPanel() {
   title.textContent = "話者リスト";
   header.appendChild(title);
 
+  if (state.config?.provider !== "voicevox") {
+    const content = document.createElement("div");
+    content.className = "panel__content";
+    content.id = "speaker-panel-content";
+    const placeholder = document.createElement("div");
+    placeholder.className = "placeholder";
+    placeholder.textContent = "VOICEVOX を利用する場合に話者リストがここに表示されます。";
+    content.appendChild(placeholder);
+    panel.append(header, content);
+    return panel;
+  }
+
+  const toolbar = renderSpeakerToolbar();
+
   const content = document.createElement("div");
   content.className = "panel__content";
   content.id = "speaker-panel-content";
-  const placeholder = document.createElement("div");
-  placeholder.className = "placeholder";
-  placeholder.textContent = "フェーズ4で話者リストと音声プレビューを実装予定です。";
-  content.appendChild(placeholder);
 
-  panel.append(header, content);
+  if (state.speakerError) {
+    const alert = document.createElement("div");
+    alert.className = "alert";
+    alert.textContent = state.speakerError;
+    content.appendChild(alert);
+  }
+
+  if (state.speakerLoading) {
+    content.appendChild(renderLoadingIndicator());
+  } else if (!state.speakers.length) {
+    const placeholder = document.createElement("div");
+    placeholder.className = "placeholder";
+    placeholder.textContent = "利用可能な話者が見つかりません。\"再取得\" を押して更新してください。";
+    content.appendChild(placeholder);
+  } else {
+    content.appendChild(renderSpeakerList());
+  }
+
+  panel.append(header, toolbar, content);
   return panel;
+}
+
+/**
+ * 話者リスト用のツールバーを描画する。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function renderSpeakerToolbar() {
+  const toolbar = document.createElement("div");
+  toolbar.className = "toolbar";
+  toolbar.id = "speaker-toolbar";
+
+  const searchForm = document.createElement("form");
+  searchForm.className = "toolbar__group";
+  searchForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = searchForm.querySelector("input");
+    const query = input ? input.value.trim() : "";
+    await loadSpeakers({ query, refresh: true });
+  });
+
+  const input = document.createElement("input");
+  input.type = "search";
+  input.placeholder = "話者名・IDで検索";
+  input.value = state.speakerQuery || "";
+  input.className = "token-form__input";
+  input.style.margin = "0";
+
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "button-primary";
+  submit.textContent = "検索";
+  searchForm.append(input, submit);
+
+  const resetButton = document.createElement("button");
+  resetButton.type = "button";
+  resetButton.className = "button-secondary";
+  resetButton.textContent = "絞り込み解除";
+  resetButton.addEventListener("click", async () => {
+    if (!state.speakerQuery) {
+      await loadSpeakers({ query: "", refresh: true });
+      return;
+    }
+    input.value = "";
+    await loadSpeakers({ query: "", refresh: true });
+  });
+
+  const refreshButton = document.createElement("button");
+  refreshButton.type = "button";
+  refreshButton.className = "button-secondary";
+  refreshButton.textContent = "再取得";
+  refreshButton.addEventListener("click", async () => {
+    await loadSpeakers({ query: state.speakerQuery, refresh: true });
+  });
+
+  const summary = document.createElement("span");
+  summary.className = "toolbar__summary";
+  summary.textContent = `話者数: ${state.speakerTotal}`;
+
+  toolbar.append(searchForm, resetButton, refreshButton, summary);
+  return toolbar;
+}
+
+/**
+ * 話者カードの一覧を描画する。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function renderSpeakerList() {
+  const list = document.createElement("div");
+  list.className = "speaker-list";
+  for (const speaker of state.speakers) {
+    list.appendChild(createSpeakerCard(speaker));
+  }
+  return list;
+}
+
+/**
+ * 話者カードを生成する。
+ * @param {any} speaker 話者情報。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function createSpeakerCard(speaker) {
+  const card = document.createElement("article");
+  card.className = "speaker-card";
+
+  const header = document.createElement("div");
+  header.className = "speaker-card__header";
+
+  const iconWrapper = document.createElement("div");
+  iconWrapper.className = "speaker-card__icon";
+  if (speaker.icon) {
+    const img = document.createElement("img");
+    img.src = speaker.icon;
+    img.alt = speaker.speaker_name || "speaker icon";
+    iconWrapper.appendChild(img);
+  } else {
+    const placeholder = document.createElement("div");
+    placeholder.className = "speaker-card__icon--empty";
+    placeholder.textContent = "No Icon";
+    iconWrapper.appendChild(placeholder);
+  }
+
+  const info = document.createElement("div");
+  info.className = "speaker-card__info";
+  const name = document.createElement("h3");
+  name.className = "speaker-card__name";
+  name.textContent = speaker.speaker_name || "(名称未設定)";
+  const meta = document.createElement("div");
+  meta.className = "speaker-card__meta";
+  meta.textContent = `ID: ${speaker.speaker_id} / UUID: ${speaker.speaker_uuid}`;
+
+  info.append(name, meta);
+  header.append(iconWrapper, info);
+
+  const samples = document.createElement("div");
+  samples.className = "speaker-card__samples";
+  const voiceSamples = Array.isArray(speaker.voice_samples) ? speaker.voice_samples : [];
+  if (voiceSamples.length) {
+    for (let index = 0; index < voiceSamples.length; index += 1) {
+      const sample = voiceSamples[index];
+      const sampleBox = document.createElement("div");
+      sampleBox.className = "speaker-card__sample";
+      const label = document.createElement("span");
+      label.textContent = `サンプル ${index + 1}`;
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.preload = "none";
+      audio.src = sample.url || sample;
+      sampleBox.append(label, audio);
+      samples.appendChild(sampleBox);
+    }
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "speaker-card__sample speaker-card__sample--empty";
+    empty.textContent = "サンプル音声は利用できません。";
+    samples.appendChild(empty);
+  }
+
+  card.append(header, samples);
+  return card;
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -895,6 +1317,9 @@ async function loadUsers(options = {}) {
   }
   state.userLoading = true;
   state.userError = "";
+  if (!state.requiresToken) {
+    render();
+  }
   const params = new URLSearchParams({ guild_id: String(state.config.guild_id) });
   if (query) {
     params.set("q", query);
@@ -925,5 +1350,60 @@ async function loadUsers(options = {}) {
   } finally {
     state.userLoading = false;
     render();
+  }
+}
+
+/**
+ * VOICEVOX の話者リストを取得する。
+ * @param {{query?: string, refresh?: boolean}} [options] 取得オプション。
+ * @returns {Promise<void>}
+ */
+async function loadSpeakers(options = {}) {
+  if (!state.config || state.config.provider !== "voicevox") {
+    return;
+  }
+  if (state.speakerLoading) {
+    return;
+  }
+  const query =
+    options.query !== undefined ? options.query.trim() : state.speakerQuery;
+  state.speakerLoading = true;
+  state.speakerError = "";
+  if (!state.requiresToken) {
+    render();
+  }
+  const params = new URLSearchParams();
+  if (query) {
+    params.set("q", query);
+  }
+  if (options.refresh) {
+    params.set("refresh", "1");
+  }
+  try {
+    const response = await apiFetch(`/api/gui/voicevox/speakers?${params.toString()}`);
+    if (response.status === 401) {
+      handleUnauthorized("認証が無効になりました。再度トークンを入力してください。");
+      return;
+    }
+    if (!response.ok) {
+      state.speakers = [];
+      state.speakerTotal = 0;
+      state.speakerError = `話者リストの取得に失敗しました (HTTP ${response.status})`;
+      return;
+    }
+    const payload = await response.json();
+    state.speakers = Array.isArray(payload.speakers) ? payload.speakers : [];
+    state.speakerTotal =
+      typeof payload.total === "number" ? payload.total : state.speakers.length;
+    state.speakerQuery = query;
+  } catch (error) {
+    state.speakers = [];
+    state.speakerTotal = 0;
+    state.speakerError = error instanceof Error ? error.message : String(error);
+  } finally {
+    state.speakerLoading = false;
+    if (!state.requiresToken) {
+      render();
+    }
   }
 }
