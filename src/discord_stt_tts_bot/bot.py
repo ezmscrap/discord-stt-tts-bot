@@ -81,6 +81,31 @@ STT_COLOR_PALETTE: list[int] = [
     0xFFC107, 0xFF9800, 0xFF5722, 0x795548,
 ]
 
+
+def _heuristic_punctuate(text: str, duration: float | None) -> str:
+    text = (text or "").strip()
+    if not text:
+        return text
+
+    repl_map = {
+        "?": "？",
+        "!": "！",
+        "。": "。",
+        "！": "！",
+        "？": "？",
+    }
+    for ascii_punct, jp_punct in (("?", "？"), ("!", "！")):
+        text = text.replace(ascii_punct, jp_punct)
+
+    has_period = any(ch in text for ch in ("。", "！", "？"))
+    if not has_period:
+        allow_len = max(6, min(40, len(text) + 5))
+        if len(text) < allow_len:
+            text = f"{text}。"
+
+    text = text.replace("。。", "。")
+    return text
+
 def _resolve_log_dir(base_dir: Path, env_value: str | None) -> Path:
     # 空 or 未設定 → デフォルト "logs"
     if not env_value or not env_value.strip():
@@ -2721,7 +2746,8 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
             metrics_state["gate_frames"] = metrics_state.get("gate_frames", 0) + int(gain_info.get("gate_frames", 0))
 
     # キャプション投稿（連投マージ対応）
-    await post_caption(guild_id, channel, user_id, username, jp_cleanup(text))
+    formatted = _heuristic_punctuate(text, dur)
+    await post_caption(guild_id, channel, user_id, username, jp_cleanup(formatted))
 
 
 # =========================
