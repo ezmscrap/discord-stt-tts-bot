@@ -3736,6 +3736,8 @@ def _build_openapi_spec(request: web.Request | None = None) -> dict[str, T.Any]:
                             "type": "object",
                             "additionalProperties": {"type": "integer"},
                         },
+                        "voicevox_primary_user_id": {"type": ["integer", "null"]},
+                        "voicevox_primary_speaker_id": {"type": ["integer", "null"]},
                     },
                     "required": ["user_name", "candidate_user_ids"],
                     "additionalProperties": False,
@@ -4110,6 +4112,8 @@ def _gui_enrich_entry_with_state(entry: dict[str, T.Any], state: dict | None) ->
 
     gtts_overrides: dict[str, dict[str, float]] = {}
     voicevox_speakers: dict[str, int] = {}
+    voicevox_primary_user_id: int | None = None
+    voicevox_primary_speaker_id: int | None = None
 
     if state:
         overrides = state.get("tts_overrides", {})
@@ -4129,11 +4133,16 @@ def _gui_enrich_entry_with_state(entry: dict[str, T.Any], state: dict | None) ->
             if speaker_id is not None:
                 try:
                     voicevox_speakers[str(user_id)] = int(speaker_id)
+                    if voicevox_primary_user_id is None:
+                        voicevox_primary_user_id = int(user_id)
+                        voicevox_primary_speaker_id = int(speaker_id)
                 except Exception:
                     pass
 
     payload["gtts_overrides"] = gtts_overrides
     payload["voicevox_speakers"] = voicevox_speakers
+    payload["voicevox_primary_user_id"] = voicevox_primary_user_id
+    payload["voicevox_primary_speaker_id"] = voicevox_primary_speaker_id
     return payload
 
 
@@ -4268,6 +4277,8 @@ async def gui_users_handler(request: web.Request):
                     "guild_ids": [],
                     "gtts_overrides": {},
                     "voicevox_speakers": {},
+                    "voicevox_primary_user_id": None,
+                    "voicevox_primary_speaker_id": None,
                 }
                 users.append(entry)
                 user_map[uid] = entry
@@ -4302,10 +4313,22 @@ async def gui_users_handler(request: web.Request):
                 entry["candidate_user_ids"].append(uid)
             if uid not in entry["user_ids"]:
                 entry["user_ids"].append(uid)
+            if entry.get("voicevox_primary_speaker_id") is None:
+                entry["voicevox_primary_user_id"] = uid
+                entry["voicevox_primary_speaker_id"] = speaker_id
 
         for entry in users:
             entry["candidate_user_ids"] = sorted(set(entry.get("candidate_user_ids", [])))
             entry["user_ids"] = sorted(set(entry.get("user_ids", [])))
+            # voicevox_primary が未設定の場合でも候補から補完
+            if entry.get("voicevox_primary_speaker_id") is None and entry.get("voicevox_speakers"):
+                for key, val in entry["voicevox_speakers"].items():
+                    try:
+                        entry["voicevox_primary_user_id"] = int(key)
+                        entry["voicevox_primary_speaker_id"] = int(val)
+                        break
+                    except Exception:
+                        continue
 
     payload = {"ok": True, "users": users, "total": len(users)}
     if keyword:

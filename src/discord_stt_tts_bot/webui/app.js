@@ -786,7 +786,27 @@ function createVoicevoxControl(user, candidateIds) {
   const container = document.createElement("div");
   container.className = "user-card__control";
 
-  if (!candidateIds.length) {
+  const overridesSource = user.voicevox_speakers || {};
+  const primaryUserIdRaw = user.voicevox_primary_user_id;
+  const primarySpeakerIdRaw = user.voicevox_primary_speaker_id;
+  const candidateList = Array.from(new Set(candidateIds));
+  const overrides = { ...overridesSource };
+
+  if (typeof primaryUserIdRaw === "number" && !Number.isNaN(primaryUserIdRaw)) {
+    if (!candidateList.includes(primaryUserIdRaw)) {
+      candidateList.push(primaryUserIdRaw);
+    }
+    if (
+      typeof primarySpeakerIdRaw === "number" &&
+      !Number.isNaN(primarySpeakerIdRaw)
+    ) {
+      overrides[String(primaryUserIdRaw)] = primarySpeakerIdRaw;
+    }
+  }
+
+  candidateList.sort((a, b) => a - b);
+
+  if (!candidateList.length) {
     const note = document.createElement("div");
     note.className = "alert";
     note.textContent = "適用可能なユーザIDが見つかりません。ログ取得後に再度お試しください。";
@@ -817,12 +837,20 @@ function createVoicevoxControl(user, candidateIds) {
   userLabel.textContent = "対象ユーザ ID";
   const userSelect = document.createElement("select");
   userSelect.name = "user-id";
-  const voicevoxOverrides = user.voicevox_speakers || {};
-  const initialUserId =
-    candidateIds
+  const primaryUserId =
+    typeof primaryUserIdRaw === "number" && !Number.isNaN(primaryUserIdRaw)
+      ? String(primaryUserIdRaw)
+      : null;
+  let initialUserId = primaryUserId;
+  if (!initialUserId) {
+    initialUserId = candidateList
       .map((id) => String(id))
-      .find((id) => voicevoxOverrides[id] !== undefined) ?? String(candidateIds[0]);
-  for (const id of candidateIds) {
+      .find((id) => overrides[id] !== undefined);
+  }
+  if (!initialUserId) {
+    initialUserId = String(candidateList[0]);
+  }
+  for (const id of candidateList) {
     const option = document.createElement("option");
     option.value = String(id);
     option.textContent = String(id);
@@ -868,7 +896,12 @@ function createVoicevoxControl(user, candidateIds) {
   selectionHint.className = "user-card__selection-hint";
 
   const syncCurrent = () => {
-    const currentMapping = user.voicevox_speakers?.[userSelect.value];
+    let currentMapping = overrides[userSelect.value];
+    if (currentMapping === undefined && user.voicevox_primary_user_id != null) {
+      if (String(user.voicevox_primary_user_id) === userSelect.value) {
+        currentMapping = user.voicevox_primary_speaker_id;
+      }
+    }
     if (currentMapping !== undefined && currentMapping !== null) {
       const parsed = Number.parseInt(currentMapping, 10);
       const value = String(currentMapping);
