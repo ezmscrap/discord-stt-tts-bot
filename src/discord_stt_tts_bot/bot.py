@@ -4216,6 +4216,97 @@ async def gui_users_handler(request: web.Request):
 
     state = get_state(guild_id) if guild_id else None
     users = [_gui_enrich_entry_with_state(entry, state) for entry in filtered]
+
+    if state:
+        # 既存エントリを user_id -> entry にマッピング
+        user_map: dict[int, dict[str, T.Any]] = {}
+        overrides_state = state.get("tts_overrides", {}) or {}
+        speakers_state = state.get("tts_speakers", {}) or {}
+
+        for entry in users:
+            candidate_ids: list[int] = []
+            for raw_id in entry.get("candidate_user_ids", []):
+                try:
+                    candidate_ids.append(int(raw_id))
+                except Exception:
+                    continue
+            entry["candidate_user_ids"] = sorted(set(candidate_ids))
+
+            # user_ids / author_ids も整数化（存在する場合）
+            normalized_user_ids: list[int] = []
+            for raw_id in entry.get("user_ids", []):
+                try:
+                    normalized_user_ids.append(int(raw_id))
+                except Exception:
+                    continue
+            entry["user_ids"] = sorted(set(normalized_user_ids))
+
+            normalized_author_ids: list[int] = []
+            for raw_id in entry.get("author_ids", []):
+                try:
+                    normalized_author_ids.append(int(raw_id))
+                except Exception:
+                    continue
+            entry["author_ids"] = sorted(set(normalized_author_ids))
+
+            entry.setdefault("gtts_overrides", {})
+            entry.setdefault("voicevox_speakers", {})
+
+            for uid in entry["candidate_user_ids"]:
+                user_map[uid] = entry
+
+        def _ensure_entry(uid: int) -> dict[str, T.Any]:
+            entry = user_map.get(uid)
+            if entry is None:
+                entry = {
+                    "user_name": f"User {uid}",
+                    "user_displays": [],
+                    "user_ids": [uid],
+                    "author_displays": [],
+                    "author_ids": [],
+                    "candidate_user_ids": [uid],
+                    "guild_ids": [],
+                    "gtts_overrides": {},
+                    "voicevox_speakers": {},
+                }
+                users.append(entry)
+                user_map[uid] = entry
+            return entry
+
+        for raw_uid, cfg in overrides_state.items():
+            try:
+                uid = int(raw_uid)
+            except Exception:
+                continue
+            entry = _ensure_entry(uid)
+            entry.setdefault("gtts_overrides", {})
+            entry["gtts_overrides"][str(uid)] = {
+                "semitones": float(cfg.get("semitones", 0.0)) if isinstance(cfg, dict) else 0.0,
+                "tempo": float(cfg.get("tempo", 1.0)) if isinstance(cfg, dict) else 1.0,
+            }
+            if uid not in entry["candidate_user_ids"]:
+                entry["candidate_user_ids"].append(uid)
+            if uid not in entry["user_ids"]:
+                entry["user_ids"].append(uid)
+
+        for raw_uid, speaker in speakers_state.items():
+            try:
+                uid = int(raw_uid)
+                speaker_id = int(speaker)
+            except Exception:
+                continue
+            entry = _ensure_entry(uid)
+            entry.setdefault("voicevox_speakers", {})
+            entry["voicevox_speakers"][str(uid)] = speaker_id
+            if uid not in entry["candidate_user_ids"]:
+                entry["candidate_user_ids"].append(uid)
+            if uid not in entry["user_ids"]:
+                entry["user_ids"].append(uid)
+
+        for entry in users:
+            entry["candidate_user_ids"] = sorted(set(entry.get("candidate_user_ids", [])))
+            entry["user_ids"] = sorted(set(entry.get("user_ids", [])))
+
     payload = {"ok": True, "users": users, "total": len(users)}
     if keyword:
         payload["query"] = keyword
