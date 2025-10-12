@@ -160,6 +160,21 @@ body {
   text-align: center;
 }
 
+.notice {
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(96, 165, 250, 0.18);
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  color: #bfdbfe;
+  font-size: 0.85rem;
+}
+
+.notice--success {
+  background: rgba(74, 222, 128, 0.18);
+  border-color: rgba(74, 222, 128, 0.35);
+  color: #bbf7d0;
+}
+
 .alert {
   padding: 12px 16px;
   border-radius: 12px;
@@ -177,6 +192,22 @@ body {
   font-size: 0.8rem;
 }
 
+.button-primary {
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: none;
+  background: linear-gradient(135deg, #6366f1, #a855f7);
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+
+.button-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(99, 102, 241, 0.35);
+}
+
 .button-secondary {
   padding: 8px 14px;
   border-radius: 10px;
@@ -189,6 +220,16 @@ body {
 
 .button-secondary:hover {
   background: rgba(255, 255, 255, 0.08);
+}
+
+.toolbar__group input {
+  min-width: 220px;
+}
+
+.toolbar__summary {
+  align-self: center;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.65);
 }
 
 .loading-indicator {
@@ -205,6 +246,142 @@ body {
   border-top-color: #a855f7;
   border-radius: 50%;
   animation: spin 0.9s linear infinite;
+}
+
+.user-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.user-card {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.user-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.user-card__title {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.user-card__ids {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.user-card__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 0.85rem;
+}
+
+.user-card__meta-row {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.user-card__meta-label {
+  min-width: 110px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.user-card__meta-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.user-card__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.user-card__control {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  font-size: 0.8rem;
+}
+
+.badge--id {
+  background: rgba(59, 130, 246, 0.18);
+  color: #bfdbfe;
+}
+
+.badge--display {
+  background: rgba(248, 113, 113, 0.18);
+  color: #fecaca;
+}
+
+.badge--author {
+  background: rgba(134, 239, 172, 0.18);
+  color: #bbf7d0;
+}
+
+.badge--gtts {
+  background: rgba(244, 114, 182, 0.18);
+  color: #fbcfe8;
+}
+
+.badge--voicevox {
+  background: rgba(110, 231, 183, 0.18);
+  color: #d1fae5;
+}
+
+.gtts-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.gtts-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.85rem;
+}
+
+.gtts-form input,
+.gtts-form select {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(17, 18, 20, 0.8);
+  color: inherit;
+  font-size: 0.95rem;
+}
+
+.gtts-form__actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
 }
 
 @keyframes spin {

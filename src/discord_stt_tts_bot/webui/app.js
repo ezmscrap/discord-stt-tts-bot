@@ -26,7 +26,32 @@ const state = {
   requiresToken: false,
   loading: false,
   error: "",
+  users: [],
+  userLoading: false,
+  userError: "",
+  userMessage: "",
+  userQuery: "",
+  userTotal: 0,
 };
+
+/**
+ * 認証エラー発生時の状態リセットを行う。
+ * @param {string} message 画面に表示するメッセージ。
+ * @returns {void}
+ */
+function handleUnauthorized(message) {
+  clearStoredToken();
+  state.token = "";
+  state.config = null;
+  state.requiresToken = true;
+  state.error = message;
+  state.users = [];
+  state.userLoading = false;
+  state.userError = "";
+  state.userMessage = "";
+  state.loading = false;
+  render();
+}
 
 /**
  * localStorage に保存済みのトークンを読み出す。
@@ -81,40 +106,44 @@ async function apiFetch(path, options = {}) {
  * 設定情報の取得を行い、状態を更新する。
  * @returns {Promise<void>}
  */
-async function loadConfig() {
+async function loadConfig(options = {}) {
   if (state.loading) {
-    return;
+    return false;
   }
   state.loading = true;
   if (!state.config) {
     render();
   }
+  let success = false;
   try {
     const response = await apiFetch("/api/gui/config");
     if (response.status === 401) {
-      state.config = null;
-      state.requiresToken = true;
-      state.error = "管理トークンを入力してください。";
-      state.token = "";
-      clearStoredToken();
-      return;
+      handleUnauthorized("管理トークンを入力してください。");
+      return false;
     }
     if (!response.ok) {
       state.config = null;
       state.error = `設定の取得に失敗しました (HTTP ${response.status})`;
-      return;
+      return false;
     }
     const payload = await response.json();
     state.config = payload;
-    state.requiresToken = Boolean(payload.requires_token);
+    state.requiresToken = Boolean(payload.requires_token) && !state.token;
     state.error = "";
+    success = true;
   } catch (error) {
     state.config = null;
     state.error = error instanceof Error ? error.message : String(error);
   } finally {
-    state.loading = false;
-    render();
+    if (!state.requiresToken) {
+      state.loading = false;
+      render();
+    }
   }
+  if (success && options.reloadUsers !== false) {
+    await loadUsers({ refresh: true });
+  }
+  return success;
 }
 
 /**
@@ -290,6 +319,11 @@ function renderHeader() {
     state.config = null;
     state.requiresToken = true;
     state.error = "管理トークンを入力してください。";
+    state.users = [];
+    state.userError = "";
+    state.userMessage = "";
+    state.userQuery = "";
+    state.userTotal = 0;
     render();
   });
 
@@ -366,16 +400,447 @@ function renderUserPanel() {
   title.textContent = "ユーザリスト";
   header.appendChild(title);
 
+  const toolbar = renderUserToolbar();
+
   const content = document.createElement("div");
   content.className = "panel__content";
   content.id = "user-panel-content";
-  const placeholder = document.createElement("div");
-  placeholder.className = "placeholder";
-  placeholder.textContent = "フェーズ3でユーザリストを実装予定です。";
-  content.appendChild(placeholder);
 
-  panel.append(header, content);
+  if (state.userMessage) {
+    const notice = document.createElement("div");
+    notice.className = "notice notice--success";
+    notice.textContent = state.userMessage;
+    content.appendChild(notice);
+  }
+
+  if (state.userError) {
+    const error = document.createElement("div");
+    error.className = "alert";
+    error.textContent = state.userError;
+    content.appendChild(error);
+  }
+
+  if (state.userLoading) {
+    content.appendChild(renderLoadingIndicator());
+  } else if (!state.users || state.users.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "placeholder";
+    empty.textContent = state.userQuery
+      ? "検索条件に一致するユーザは見つかりませんでした。"
+      : "ログからユーザ情報をまだ取得できていません。";
+    content.appendChild(empty);
+  } else {
+    content.appendChild(renderUserList());
+  }
+
+  panel.append(header, toolbar, content);
   return panel;
+}
+
+/**
+ * ユーザリスト用のツールバーを描画する。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function renderUserToolbar() {
+  const toolbar = document.createElement("div");
+  toolbar.className = "toolbar";
+  toolbar.id = "user-toolbar";
+
+  const searchForm = document.createElement("form");
+  searchForm.className = "toolbar__group";
+  searchForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = searchForm.querySelector("input");
+    const query = input ? input.value.trim() : "";
+    await loadUsers({ query, refresh: true });
+  });
+
+  const input = document.createElement("input");
+  input.type = "search";
+  input.placeholder = "ユーザ名・IDで検索";
+  input.value = state.userQuery || "";
+  input.className = "token-form__input";
+  input.style.margin = "0";
+
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "button-primary";
+  submit.textContent = "検索";
+
+  searchForm.append(input, submit);
+
+  const resetButton = document.createElement("button");
+  resetButton.type = "button";
+  resetButton.className = "button-secondary";
+  resetButton.textContent = "絞り込み解除";
+  resetButton.addEventListener("click", async () => {
+    if (!state.userQuery) {
+      await loadUsers({ query: "", refresh: true, clearMessage: true });
+      return;
+    }
+    input.value = "";
+    await loadUsers({ query: "", refresh: true, clearMessage: true });
+  });
+
+  toolbar.append(searchForm, resetButton);
+
+  const summary = document.createElement("span");
+  summary.className = "toolbar__summary";
+  summary.textContent = `表示件数: ${state.userTotal}`;
+  toolbar.appendChild(summary);
+
+  return toolbar;
+}
+
+/**
+ * ユーザカードの一覧を描画する。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function renderUserList() {
+  const list = document.createElement("div");
+  list.className = "user-list";
+  for (const user of state.users) {
+    list.appendChild(createUserCard(user));
+  }
+  return list;
+}
+
+/**
+ * ユーザカードを生成する。
+ * @param {any} user ユーザ情報。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function createUserCard(user) {
+  const card = document.createElement("article");
+  card.className = "user-card";
+
+  const header = document.createElement("div");
+  header.className = "user-card__header";
+
+  const title = document.createElement("h3");
+  title.className = "user-card__title";
+  title.textContent = user.user_name || "(名称未設定)";
+  header.appendChild(title);
+
+  const idGroup = document.createElement("div");
+  idGroup.className = "user-card__ids";
+  const candidateIds = Array.isArray(user.candidate_user_ids) ? user.candidate_user_ids : [];
+  if (candidateIds.length) {
+    for (const id of candidateIds) {
+      idGroup.appendChild(createBadge(`ID ${id}`, "badge--id"));
+    }
+  } else {
+    idGroup.appendChild(createBadge("ID未検出", "badge"));
+  }
+  header.appendChild(idGroup);
+
+  const meta = document.createElement("div");
+  meta.className = "user-card__meta";
+  if (Array.isArray(user.user_displays) && user.user_displays.length) {
+    meta.appendChild(createMetaRow("user_display", user.user_displays, "badge--display"));
+  }
+  if (Array.isArray(user.author_displays) && user.author_displays.length) {
+    meta.appendChild(createMetaRow("author_display", user.author_displays, "badge--author"));
+  }
+  const gttsEntries = Object.entries(user.gtts_overrides || {});
+  if (gttsEntries.length) {
+    const values = gttsEntries.map(([id, cfg]) => {
+      const semi = Number.parseFloat(cfg.semitones).toFixed(1);
+      const tempo = Number.parseFloat(cfg.tempo).toFixed(2);
+      return `${id}: ${semi} / ${tempo}`;
+    });
+    meta.appendChild(createMetaRow("gTTS個別", values, "badge--gtts"));
+  }
+  const voicevoxEntries = Object.entries(user.voicevox_speakers || {});
+  if (voicevoxEntries.length) {
+    const values = voicevoxEntries.map(([id, speakerId]) => `${id}: ${speakerId}`);
+    meta.appendChild(createMetaRow("VOICEVOX個別", values, "badge--voicevox"));
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "user-card__actions";
+  const provider = state.config?.provider || "";
+  if (provider === "gtts") {
+    actions.appendChild(createGttsControl(user, candidateIds));
+  } else if (provider === "voicevox") {
+    actions.appendChild(createVoicevoxControl(user, candidateIds));
+  } else {
+    const note = document.createElement("div");
+    note.className = "notice";
+    note.textContent = `現在のプロバイダ (${provider}) では個別設定を利用できません。`;
+    actions.appendChild(note);
+  }
+
+  card.append(header, meta, actions);
+  return card;
+}
+
+/**
+ * メタ情報の1行を生成する。
+ * @param {string} label 左側のラベル。
+ * @param {string[]} values 表示する値リスト。
+ * @param {string} badgeClass バッジのクラス。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function createMetaRow(label, values, badgeClass) {
+  const row = document.createElement("div");
+  row.className = "user-card__meta-row";
+  const labelNode = document.createElement("span");
+  labelNode.className = "user-card__meta-label";
+  labelNode.textContent = label;
+  row.appendChild(labelNode);
+  const container = document.createElement("div");
+  container.className = "user-card__meta-values";
+  for (const value of values) {
+    container.appendChild(createBadge(value, badgeClass));
+  }
+  row.appendChild(container);
+  return row;
+}
+
+/**
+ * バッジ要素を生成する。
+ * @param {string} text 表示するテキスト。
+ * @param {string} [variant] 追加クラス。
+ * @returns {HTMLElement} バッジノード。
+ */
+function createBadge(text, variant) {
+  const badge = document.createElement("span");
+  badge.className = variant ? `badge ${variant}` : "badge";
+  badge.textContent = text;
+  return badge;
+}
+
+/**
+ * gTTS 個別設定フォームを生成する。
+ * @param {any} user 対象ユーザ情報。
+ * @param {Array<number>} candidateIds 候補となるユーザID一覧。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function createGttsControl(user, candidateIds) {
+  const container = document.createElement("div");
+  container.className = "user-card__control";
+
+  if (!candidateIds.length) {
+    const note = document.createElement("div");
+    note.className = "alert";
+    note.textContent = "適用可能なユーザIDが見つかりません。ログ取得後に再度お試しください。";
+    container.appendChild(note);
+    return container;
+  }
+
+  const form = document.createElement("form");
+  form.className = "gtts-form";
+
+  const selectWrapper = document.createElement("label");
+  selectWrapper.textContent = "対象ユーザ ID";
+  const select = document.createElement("select");
+  select.name = "user-id";
+  for (const id of candidateIds) {
+    const option = document.createElement("option");
+    option.value = String(id);
+    option.textContent = String(id);
+    select.appendChild(option);
+  }
+  selectWrapper.appendChild(select);
+
+  const semitoneWrapper = document.createElement("label");
+  semitoneWrapper.textContent = "半音 (semitones)";
+  const semitoneInput = document.createElement("input");
+  semitoneInput.type = "number";
+  semitoneInput.name = "semitones";
+  semitoneInput.step = "0.1";
+  semitoneInput.min = "-24";
+  semitoneInput.max = "24";
+  semitoneInput.value = "0";
+  semitoneWrapper.appendChild(semitoneInput);
+
+  const tempoWrapper = document.createElement("label");
+  tempoWrapper.textContent = "テンポ倍率";
+  const tempoInput = document.createElement("input");
+  tempoInput.type = "number";
+  tempoInput.name = "tempo";
+  tempoInput.step = "0.05";
+  tempoInput.min = "0.5";
+  tempoInput.max = "3.0";
+  tempoInput.value = "1.0";
+  tempoWrapper.appendChild(tempoInput);
+
+  const actions = document.createElement("div");
+  actions.className = "gtts-form__actions";
+
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "button-primary";
+  submit.textContent = "保存";
+
+  const resetButton = document.createElement("button");
+  resetButton.type = "button";
+  resetButton.className = "button-secondary";
+  resetButton.textContent = "リセット";
+
+  actions.append(submit, resetButton);
+
+  form.append(selectWrapper, semitoneWrapper, tempoWrapper, actions);
+
+  const syncInputs = () => {
+    const current = user.gtts_overrides?.[select.value];
+    if (current) {
+      semitoneInput.value = Number.parseFloat(current.semitones).toFixed(1);
+      tempoInput.value = Number.parseFloat(current.tempo).toFixed(2);
+    } else {
+      semitoneInput.value = "0.0";
+      tempoInput.value = "1.0";
+    }
+  };
+  syncInputs();
+
+  select.addEventListener("change", () => {
+    syncInputs();
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const userId = Number.parseInt(select.value, 10);
+    const semitones = Number.parseFloat(semitoneInput.value);
+    const tempo = Number.parseFloat(tempoInput.value);
+    if (Number.isNaN(userId) || Number.isNaN(semitones) || Number.isNaN(tempo)) {
+      state.userError = "半音・テンポはいずれも数値で指定してください。";
+      render();
+      return;
+    }
+    state.userMessage = "保存中...";
+    render();
+    await handleGttsSubmit(userId, semitones, tempo);
+  });
+
+  resetButton.addEventListener("click", async () => {
+    const userId = Number.parseInt(select.value, 10);
+    if (Number.isNaN(userId)) {
+      return;
+    }
+    state.userMessage = "リセット中...";
+    render();
+    await handleGttsReset(userId);
+  });
+
+  container.appendChild(form);
+  return container;
+}
+
+/**
+ * VOICEVOX 向けコントロールのプレースホルダーを生成する。
+ * @param {any} user 対象ユーザ情報。
+ * @param {Array<number>} candidateIds 候補となるユーザID一覧。
+ * @returns {HTMLElement} レンダリング用ノード。
+ */
+function createVoicevoxControl(user, candidateIds) {
+  const container = document.createElement("div");
+  container.className = "user-card__control";
+
+  const note = document.createElement("div");
+  note.className = "notice";
+  const entries = Object.entries(user.voicevox_speakers || {});
+  if (entries.length) {
+    const mappings = entries.map(([id, speaker]) => `${id} → ${speaker}`).join(", ");
+    note.textContent = `現在の話者ID: ${mappings}`;
+  } else if (candidateIds.length) {
+    note.textContent = "VOICEVOX 話者設定はまだありません。話者リストの読み込み後に設定できます。";
+  } else {
+    note.textContent = "VOICEVOX の個別設定を行うにはログでユーザIDを取得してください。";
+  }
+  container.appendChild(note);
+  return container;
+}
+
+/**
+ * gTTS 設定の保存を実行する。
+ * @param {number} userId 対象ユーザID。
+ * @param {number} semitones 半音設定。
+ * @param {number} tempo テンポ設定。
+ * @returns {Promise<void>}
+ */
+async function handleGttsSubmit(userId, semitones, tempo) {
+  if (!state.config) {
+    return;
+  }
+  try {
+    const response = await apiFetch(`/api/gui/gtts/${state.config.guild_id}/${userId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ semitones, tempo }),
+    });
+    if (response.status === 401) {
+      handleUnauthorized("認証が無効になりました。再度トークンを入力してください。");
+      return;
+    }
+    if (!response.ok) {
+      state.userError = await extractErrorMessage(response);
+      state.userMessage = "";
+      render();
+      return;
+    }
+    state.userMessage = "設定を保存しました。";
+    await loadUsers({ refresh: true, clearMessage: false });
+  } catch (error) {
+    state.userError = error instanceof Error ? error.message : String(error);
+    state.userMessage = "";
+    render();
+  }
+}
+
+/**
+ * gTTS 設定のリセットを実行する。
+ * @param {number} userId 対象ユーザID。
+ * @returns {Promise<void>}
+ */
+async function handleGttsReset(userId) {
+  if (!state.config) {
+    return;
+  }
+  try {
+    const response = await apiFetch(`/api/gui/gtts/${state.config.guild_id}/${userId}`, {
+      method: "DELETE",
+    });
+    if (response.status === 401) {
+      handleUnauthorized("認証が無効になりました。再度トークンを入力してください。");
+      return;
+    }
+    if (!response.ok) {
+      state.userError = await extractErrorMessage(response);
+      state.userMessage = "";
+      render();
+      return;
+    }
+    state.userMessage = "設定をリセットしました。";
+    await loadUsers({ refresh: true, clearMessage: false });
+  } catch (error) {
+    state.userError = error instanceof Error ? error.message : String(error);
+    state.userMessage = "";
+    render();
+  }
+}
+
+/**
+ * API レスポンスからエラーメッセージを抽出する。
+ * @param {Response} response フェッチレスポンス。
+ * @returns {Promise<string>} エラーメッセージ。
+ */
+async function extractErrorMessage(response) {
+  try {
+    const data = await response.json();
+    if (data && typeof data === "object") {
+      if (typeof data.message === "string") {
+        return data.message;
+      }
+      if (typeof data.error === "string") {
+        return data.error;
+      }
+    }
+  } catch {
+    // JSON でない場合は無視してステータステキストを利用する。
+  }
+  return response.statusText || "不明なエラーが発生しました。";
 }
 
 /**
@@ -411,3 +876,54 @@ document.addEventListener("DOMContentLoaded", () => {
     console.error("アプリ初期化中にエラーが発生しました。", error);
   });
 });
+/**
+ * ユーザリストを取得する。
+ * @param {{query?: string, refresh?: boolean, clearMessage?: boolean}} [options] 取得オプション。
+ * @returns {Promise<void>}
+ */
+async function loadUsers(options = {}) {
+  if (!state.config) {
+    return;
+  }
+  if (state.userLoading) {
+    return;
+  }
+  const query = options.query !== undefined ? options.query.trim() : state.userQuery;
+  const shouldClearMessage = options.clearMessage !== false;
+  if (shouldClearMessage) {
+    state.userMessage = "";
+  }
+  state.userLoading = true;
+  state.userError = "";
+  const params = new URLSearchParams({ guild_id: String(state.config.guild_id) });
+  if (query) {
+    params.set("q", query);
+  }
+  if (options.refresh) {
+    params.set("refresh", "1");
+  }
+  try {
+    const response = await apiFetch(`/api/gui/users?${params.toString()}`);
+    if (response.status === 401) {
+      handleUnauthorized("認証が無効になりました。再度トークンを入力してください。");
+      return;
+    }
+    if (!response.ok) {
+      state.users = [];
+      state.userTotal = 0;
+      state.userError = `ユーザ一覧の取得に失敗しました (HTTP ${response.status})`;
+      return;
+    }
+    const payload = await response.json();
+    state.users = Array.isArray(payload.users) ? payload.users : [];
+    state.userTotal = typeof payload.total === "number" ? payload.total : state.users.length;
+    state.userQuery = query;
+  } catch (error) {
+    state.users = [];
+    state.userTotal = 0;
+    state.userError = error instanceof Error ? error.message : String(error);
+  } finally {
+    state.userLoading = false;
+    render();
+  }
+}
