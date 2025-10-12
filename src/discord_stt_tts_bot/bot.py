@@ -77,6 +77,7 @@ ccfo_queue: "asyncio.Queue[dict]" = asyncio.Queue()
 GUI_ADMIN_TOKEN = os.getenv("GUI_ADMIN_TOKEN", "").strip()
 GUI_USER_CACHE_TTL = float(os.getenv("GUI_USER_CACHE_TTL", "15"))
 GUI_VOICEVOX_CACHE_TTL = float(os.getenv("GUI_VOICEVOX_CACHE_TTL", "60"))
+GUI_STATIC_ROOT = PACKAGE_DIR / "webui"
 
 # GUI 用のキャッシュは asyncio.Lock で保護する
 _gui_user_cache: dict[str, T.Any] = {"timestamp": 0.0, "entries": []}
@@ -3389,6 +3390,22 @@ async def docs_handler(request: web.Request):
 
 # === GUI Web API START ===
 
+async def gui_index_handler(request: web.Request):
+    """GUI のトップページを返す。
+
+    Args:
+        request: aiohttp のリクエスト。
+
+    Returns:
+        index.html を指す FileResponse。
+    """
+    index_path = GUI_STATIC_ROOT / "index.html"
+    if not index_path.exists():
+        raise web.HTTPNotFound(text="GUI assets are not available.")
+    response = web.FileResponse(index_path)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
 def _ensure_gui_auth(request: web.Request) -> None:
     """GUI API 用の簡易認証を行う。
 
@@ -4057,6 +4074,8 @@ async def _start_ccfo_web_server():
         web.options("/ccfolia_event", ccfo_options_handler),  # ← 追加
         web.get("/openapi.json", openapi_handler),
         web.get("/docs", docs_handler),
+        web.get("/gui", gui_index_handler),
+        web.get("/gui/", gui_index_handler),
         web.get("/api/gui/config", gui_config_handler),
         web.get("/api/gui/users", gui_users_handler),
         web.put("/api/gui/gtts/{guild_id}/{user_id}", gui_update_gtts_handler),
@@ -4065,6 +4084,8 @@ async def _start_ccfo_web_server():
         web.delete("/api/gui/voicevox/{guild_id}/{user_id}", gui_delete_voicevox_handler),
         web.get("/api/gui/voicevox/speakers", gui_voicevox_speakers_handler),
     ])
+    if GUI_STATIC_ROOT.exists():
+        app.router.add_static("/gui/static", str(GUI_STATIC_ROOT), show_index=False)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host=CCFO_HOST, port=CCFO_PORT)
