@@ -73,6 +73,18 @@ CCFO_DEFAULT_SPK = int(os.getenv("CCFOLIA_DEFAULT_SPEAKER", "2"))
 ccfo_queue: "asyncio.Queue[dict]" = asyncio.Queue()
 # === CCFOLIA BRIDGE END: env ===
 
+# === GUI 簡易設定 ===
+GUI_ADMIN_TOKEN = os.getenv("GUI_ADMIN_TOKEN", "").strip()
+GUI_USER_CACHE_TTL = float(os.getenv("GUI_USER_CACHE_TTL", "15"))
+GUI_VOICEVOX_CACHE_TTL = float(os.getenv("GUI_VOICEVOX_CACHE_TTL", "60"))
+
+# GUI 用のキャッシュは asyncio.Lock で保護する
+_gui_user_cache: dict[str, T.Any] = {"timestamp": 0.0, "entries": []}
+_gui_user_cache_lock = asyncio.Lock()
+_gui_voicevox_cache: dict[str, T.Any] = {"timestamp": 0.0, "items": []}
+_gui_voicevox_cache_lock = asyncio.Lock()
+# === GUI 簡易設定 終了 ===
+
 # STT字幕用の基本16色（視認性の高い色を選択）
 STT_COLOR_PALETTE: list[int] = [
     0xF44336, 0xE91E63, 0x9C27B0, 0x673AB7,
@@ -3375,6 +3387,631 @@ async def docs_handler(request: web.Request):
     return web.Response(text=html, content_type="text/html")
 
 
+# === GUI Web API START ===
+
+def _ensure_gui_auth(request: web.Request) -> None:
+    """GUI API 用の簡易認証を行う。
+
+    Args:
+        request: 認証対象のリクエスト。
+    """
+    if not GUI_ADMIN_TOKEN:
+        return
+
+    header_token = (request.headers.get("X-Admin-Token") or "").strip()
+    query_token = (request.query.get("token") or "").strip()
+    token = header_token or query_token
+    if token != GUI_ADMIN_TOKEN:
+        payload = {"ok": False, "error": "unauthorized", "message": "GUI 管理トークンが一致しません。"}
+        raise web.HTTPUnauthorized(
+            text=json.dumps(payload, ensure_ascii=False),
+            content_type="application/json",
+            headers={"WWW-Authenticate": 'Token realm="GUI"'},
+        )
+
+
+def _gui_error(status: int, code: str, message: str | None = None) -> web.Response:
+    """GUI API 向けのエラーレスポンスを生成する。
+
+    Args:
+        status: HTTP ステータスコード。
+        code: エラー識別子。
+        message: 追加の説明文。省略可。
+
+    Returns:
+        エラーメッセージを格納した JSON レスポンス。
+    """
+    payload: dict[str, T.Any] = {"ok": False, "error": code}
+    if message:
+        payload["message"] = message
+    return web.json_response(payload, status=status, dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
+
+
+def _extract_numeric_id(raw: T.Any) -> int | None:
+    """CSV などから取得した値を Discord ユーザーIDとして解釈する。
+
+    Args:
+        raw: 解析対象の値。
+
+    Returns:
+        整数IDに変換できた場合はその値。失敗した場合は None。
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        if math.isnan(raw) or math.isinf(raw):
+            return None
+        return int(raw)
+    try:
+        text = str(raw).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _wrap_data_url(raw: str | None, mime: str) -> str | None:
+    """VOICEVOX から受け取った Base64 を data URL 形式へ変換する。
+
+    Args:
+        raw: Base64 文字列または data URL。
+        mime: data URL に付与する MIME タイプ。
+
+    Returns:
+        data URL 形式の文字列。入力が空の場合は None。
+    """
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if value.startswith("data:"):
+        return value
+    return f"data:{mime};base64,{value}"
+
+
+def _load_gui_user_entries_sync() -> list[dict[str, T.Any]]:
+    """GUI 向けにログファイルからユーザ情報を抽出する同期処理。
+
+    Returns:
+        ユーザ情報辞書のリスト。
+    """
+    entries: dict[str, dict[str, T.Any]] = {}
+
+    def ensure_entry(name: str) -> dict[str, T.Any]:
+        """名前に対応するエントリを作成または取得する。"""
+        return entries.setdefault(
+            name,
+            {
+                "user_name": name,
+                "user_displays": set(),
+                "user_ids": set(),
+                "author_displays": set(),
+                "author_ids": set(),
+                "guild_ids": set(),
+            },
+        )
+
+    if STT_LOG_PATH.exists():
+        try:
+            with open(STT_LOG_PATH, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    display = (row.get("user_display") or "").strip()
+                    if not display:
+                        continue
+                    entry = ensure_entry(display)
+                    entry["user_displays"].add(display)
+                    uid = _extract_numeric_id(row.get("user_id"))
+                    if uid is not None:
+                        entry["user_ids"].add(uid)
+                    gid = _extract_numeric_id(row.get("guild_id"))
+                    if gid is not None:
+                        entry["guild_ids"].add(gid)
+        except Exception as exc:
+            print(f"[GUI] failed to parse STT logs: {exc!r}")
+
+    if TTS_LOG_PATH.exists():
+        try:
+            with open(TTS_LOG_PATH, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    display = (row.get("author_display") or "").strip()
+                    if not display:
+                        continue
+                    entry = ensure_entry(display)
+                    entry["author_displays"].add(display)
+                    aid = _extract_numeric_id(row.get("author_id"))
+                    if aid is not None:
+                        entry["author_ids"].add(aid)
+                    gid = _extract_numeric_id(row.get("guild_id"))
+                    if gid is not None:
+                        entry["guild_ids"].add(gid)
+        except Exception as exc:
+            print(f"[GUI] failed to parse TTS logs: {exc!r}")
+
+    result: list[dict[str, T.Any]] = []
+    for name, entry in entries.items():
+        user_ids = sorted(entry["user_ids"])
+        author_ids = sorted(entry["author_ids"])
+        candidates = sorted({*user_ids, *author_ids})
+        result.append(
+            {
+                "user_name": name,
+                "user_displays": sorted(entry["user_displays"]),
+                "user_ids": user_ids,
+                "author_displays": sorted(entry["author_displays"]),
+                "author_ids": author_ids,
+                "candidate_user_ids": candidates,
+                "guild_ids": sorted(entry["guild_ids"]),
+            }
+        )
+    result.sort(key=lambda x: x["user_name"])
+    return result
+
+
+async def _gui_get_user_entries(force_refresh: bool = False) -> list[dict[str, T.Any]]:
+    """GUI ユーザ一覧のキャッシュ管理を行いながらデータを取得する。
+
+    Args:
+        force_refresh: True の場合はキャッシュを無視して再読込する。
+
+    Returns:
+        ユーザ情報辞書のリスト。
+    """
+    now = time.time()
+    async with _gui_user_cache_lock:
+        cached_entries = _gui_user_cache.get("entries") or []
+        cached_at = float(_gui_user_cache.get("timestamp") or 0.0)
+        if cached_entries and not force_refresh and (now - cached_at) < GUI_USER_CACHE_TTL:
+            return cached_entries
+
+    loop = asyncio.get_running_loop()
+    entries = await loop.run_in_executor(None, _load_gui_user_entries_sync)
+
+    async with _gui_user_cache_lock:
+        _gui_user_cache["timestamp"] = time.time()
+        _gui_user_cache["entries"] = entries
+    return entries
+
+
+def _gui_entry_matches_keyword(entry: dict[str, T.Any], keyword: str) -> bool:
+    """ユーザエントリが検索キーワードに一致するか判定する。
+
+    Args:
+        entry: 判定対象のユーザエントリ。
+        keyword: 文字列の部分一致に利用するキーワード。
+
+    Returns:
+        一致する場合は True。
+    """
+    q = (keyword or "").strip().lower()
+    if not q:
+        return True
+    if q in (entry.get("user_name") or "").lower():
+        return True
+    for field in ("user_displays", "author_displays"):
+        for value in entry.get(field, []):
+            if q in str(value).lower():
+                return True
+    for field in ("user_ids", "author_ids", "candidate_user_ids"):
+        for value in entry.get(field, []):
+            if q in str(value).lower():
+                return True
+    return False
+
+
+def _gui_enrich_entry_with_state(entry: dict[str, T.Any], state: dict | None) -> dict[str, T.Any]:
+    """ギルド状態を付加して GUI へ返すユーザ情報を構築する。
+
+    Args:
+        entry: ログから抽出したユーザエントリ。
+        state: ギルド固有の TTS 設定。
+
+    Returns:
+        状態情報付きのユーザエントリ。
+    """
+    payload = {
+        "user_name": entry.get("user_name"),
+        "user_displays": list(entry.get("user_displays", [])),
+        "user_ids": list(entry.get("user_ids", [])),
+        "author_displays": list(entry.get("author_displays", [])),
+        "author_ids": list(entry.get("author_ids", [])),
+        "candidate_user_ids": list(entry.get("candidate_user_ids", [])),
+        "guild_ids": list(entry.get("guild_ids", [])),
+    }
+
+    gtts_overrides: dict[str, dict[str, float]] = {}
+    voicevox_speakers: dict[str, int] = {}
+
+    if state:
+        overrides = state.get("tts_overrides", {})
+        speakers = state.get("tts_speakers", {})
+        for raw_id in entry.get("candidate_user_ids", []):
+            try:
+                user_id = int(raw_id)
+            except Exception:
+                continue
+            ov = overrides.get(user_id)
+            if isinstance(ov, dict):
+                gtts_overrides[str(user_id)] = {
+                    "semitones": float(ov.get("semitones", 0.0)),
+                    "tempo": float(ov.get("tempo", 1.0)),
+                }
+            speaker_id = speakers.get(user_id)
+            if speaker_id is not None:
+                try:
+                    voicevox_speakers[str(user_id)] = int(speaker_id)
+                except Exception:
+                    pass
+
+    payload["gtts_overrides"] = gtts_overrides
+    payload["voicevox_speakers"] = voicevox_speakers
+    return payload
+
+
+def _select_default_guild_id() -> int | None:
+    """Bot が所属している最初のギルド ID を返す。
+
+    Returns:
+        最初のギルド ID。所属ギルドが無い場合は None。
+    """
+    if not bot.guilds:
+        return None
+    return bot.guilds[0].id
+
+
+async def gui_config_handler(request: web.Request):
+    """GUI 初期化時に必要な基本設定を返す。
+
+    Args:
+        request: aiohttp のリクエスト。
+
+    Returns:
+        設定情報を含む JSON レスポンス。
+    """
+    _ensure_gui_auth(request)
+    guild_id_param = (request.query.get("guild_id") or "").strip()
+    guild_id: int | None = None
+
+    if guild_id_param:
+        try:
+            guild_id = int(guild_id_param)
+        except ValueError:
+            return _gui_error(400, "invalid_guild_id", "guild_id は整数で指定してください。")
+
+    if guild_id is None:
+        guild_id = _select_default_guild_id() or 0
+
+    state = get_state(guild_id) if guild_id else None
+    payload: dict[str, T.Any] = {
+        "ok": True,
+        "provider": TTS_PROVIDER,
+        "guild_id": guild_id,
+        "requires_token": bool(GUI_ADMIN_TOKEN),
+        "available_guilds": [
+            {"guild_id": g.id, "name": g.name}
+            for g in bot.guilds
+        ],
+    }
+    if state:
+        payload["base_tempo"] = float(state.get("tts_base_tempo", 0.7))
+        payload["default_voicevox_speaker"] = int(
+            state.get("tts_default_speaker", VOICEVOX_DEFAULT_SPEAKER)
+        )
+    return web.json_response(payload, dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
+
+
+async def gui_users_handler(request: web.Request):
+    """GUI 用ユーザ一覧と個別設定を返す。
+
+    Args:
+        request: aiohttp のリクエスト。
+
+    Returns:
+        ユーザリストを含む JSON レスポンス。
+    """
+    _ensure_gui_auth(request)
+
+    guild_id_param = (request.query.get("guild_id") or "").strip()
+    guild_id = 0
+    if guild_id_param:
+        try:
+            guild_id = int(guild_id_param)
+        except ValueError:
+            return _gui_error(400, "invalid_guild_id", "guild_id は整数で指定してください。")
+    elif bot.guilds:
+        guild_id = bot.guilds[0].id
+
+    entries = await _gui_get_user_entries(force_refresh=request.query.get("refresh") == "1")
+    keyword = (request.query.get("q") or "").strip()
+    filtered = [entry for entry in entries if _gui_entry_matches_keyword(entry, keyword)]
+
+    state = get_state(guild_id) if guild_id else None
+    users = [_gui_enrich_entry_with_state(entry, state) for entry in filtered]
+    payload = {"ok": True, "users": users, "total": len(users)}
+    if keyword:
+        payload["query"] = keyword
+    return web.json_response(payload, dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
+
+
+async def gui_update_gtts_handler(request: web.Request):
+    """gTTS 向けの個別パラメータを更新する。
+
+    Args:
+        request: aiohttp のリクエスト。
+
+    Returns:
+        更新後の設定を含む JSON レスポンス。
+    """
+    _ensure_gui_auth(request)
+    if TTS_PROVIDER != "gtts":
+        return _gui_error(400, "provider_mismatch", "現在の TTS プロバイダでは gTTS 設定を変更できません。")
+
+    try:
+        guild_id = int(request.match_info.get("guild_id"))
+        user_id = int(request.match_info.get("user_id"))
+    except (TypeError, ValueError):
+        return _gui_error(400, "invalid_path", "guild_id と user_id は整数で指定してください。")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _gui_error(400, "invalid_json", "JSON ボディを解析できませんでした。")
+
+    if body.get("reset"):
+        state = get_state(guild_id)
+        state["tts_overrides"].pop(user_id, None)
+        _persist_tts_preferences(guild_id, state)
+        return web.json_response({"ok": True, "override": None})
+
+    if "semitones" not in body:
+        return _gui_error(400, "missing_field", "`semitones` を指定してください。")
+    try:
+        semitones = float(body.get("semitones"))
+    except (TypeError, ValueError):
+        return _gui_error(400, "invalid_value", "`semitones` には数値を指定してください。")
+
+    tempo_raw = body.get("tempo", 1.0)
+    try:
+        tempo = float(tempo_raw)
+    except (TypeError, ValueError):
+        return _gui_error(400, "invalid_value", "`tempo` には数値を指定してください。")
+    if tempo <= 0.0:
+        return _gui_error(400, "invalid_value", "`tempo` は正の値で指定してください。")
+
+    state = get_state(guild_id)
+    state["tts_overrides"][user_id] = {"semitones": semitones, "tempo": tempo}
+    _persist_tts_preferences(guild_id, state)
+    return web.json_response({"ok": True, "override": {"semitones": semitones, "tempo": tempo}})
+
+
+async def gui_delete_gtts_handler(request: web.Request):
+    """gTTS の個別設定を削除する。
+
+    Args:
+        request: aiohttp のリクエスト。
+
+    Returns:
+        削除結果を示す JSON レスポンス。
+    """
+    _ensure_gui_auth(request)
+    if TTS_PROVIDER != "gtts":
+        return _gui_error(400, "provider_mismatch", "現在の TTS プロバイダでは gTTS 設定を変更できません。")
+
+    try:
+        guild_id = int(request.match_info.get("guild_id"))
+        user_id = int(request.match_info.get("user_id"))
+    except (TypeError, ValueError):
+        return _gui_error(400, "invalid_path", "guild_id と user_id は整数で指定してください。")
+
+    state = get_state(guild_id)
+    state["tts_overrides"].pop(user_id, None)
+    _persist_tts_preferences(guild_id, state)
+    return web.json_response({"ok": True, "override": None})
+
+
+async def gui_update_voicevox_handler(request: web.Request):
+    """VOICEVOX 向けの話者設定を更新する。
+
+    Args:
+        request: aiohttp のリクエスト。
+
+    Returns:
+        更新後の話者設定を含む JSON レスポンス。
+    """
+    _ensure_gui_auth(request)
+    if TTS_PROVIDER != "voicevox":
+        return _gui_error(400, "provider_mismatch", "VOICEVOX を利用していません。")
+
+    try:
+        guild_id = int(request.match_info.get("guild_id"))
+        user_id = int(request.match_info.get("user_id"))
+    except (TypeError, ValueError):
+        return _gui_error(400, "invalid_path", "guild_id と user_id は整数で指定してください。")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _gui_error(400, "invalid_json", "JSON ボディを解析できませんでした。")
+
+    state = get_state(guild_id)
+
+    if body.get("reset"):
+        state["tts_speakers"].pop(user_id, None)
+        _persist_tts_preferences(guild_id, state)
+        return web.json_response({"ok": True, "speaker_id": None})
+
+    if "speaker_id" not in body:
+        return _gui_error(400, "missing_field", "`speaker_id` を指定してください。")
+    try:
+        speaker_id = int(body.get("speaker_id"))
+    except (TypeError, ValueError):
+        return _gui_error(400, "invalid_value", "`speaker_id` には整数を指定してください。")
+
+    state["tts_speakers"][user_id] = speaker_id
+    _persist_tts_preferences(guild_id, state)
+    return web.json_response({"ok": True, "speaker_id": speaker_id})
+
+
+async def gui_delete_voicevox_handler(request: web.Request):
+    """VOICEVOX の個別話者設定を削除する。
+
+    Args:
+        request: aiohttp のリクエスト。
+
+    Returns:
+        削除結果を示す JSON レスポンス。
+    """
+    _ensure_gui_auth(request)
+    if TTS_PROVIDER != "voicevox":
+        return _gui_error(400, "provider_mismatch", "VOICEVOX を利用していません。")
+
+    try:
+        guild_id = int(request.match_info.get("guild_id"))
+        user_id = int(request.match_info.get("user_id"))
+    except (TypeError, ValueError):
+        return _gui_error(400, "invalid_path", "guild_id と user_id は整数で指定してください。")
+
+    state = get_state(guild_id)
+    state["tts_speakers"].pop(user_id, None)
+    _persist_tts_preferences(guild_id, state)
+    return web.json_response({"ok": True, "speaker_id": None})
+
+
+async def _gui_get_voicevox_speakers(force_refresh: bool = False) -> list[dict[str, T.Any]]:
+    """VOICEVOX から取得した話者情報をキャッシュしつつ整形して返す。
+
+    Args:
+        force_refresh: True の場合はキャッシュを破棄して再取得する。
+
+    Returns:
+        話者情報辞書のリスト。
+    """
+    if TTS_PROVIDER != "voicevox":
+        return []
+
+    now = time.time()
+    async with _gui_voicevox_cache_lock:
+        cached_items = _gui_voicevox_cache.get("items") or []
+        cached_at = float(_gui_voicevox_cache.get("timestamp") or 0.0)
+        if cached_items and not force_refresh and (now - cached_at) < GUI_VOICEVOX_CACHE_TTL:
+            return cached_items
+
+    speakers_data = await _voicevox_fetch_json("GET", "/speakers")
+    if not isinstance(speakers_data, list):
+        speakers_data = []
+
+    compiled: list[dict[str, T.Any]] = []
+
+    for speaker in speakers_data:
+        uuid = speaker.get("speaker_uuid")
+        if not uuid:
+            continue
+        try:
+            info = await _voicevox_fetch_json("GET", "/speaker_info", params={"speaker_uuid": uuid})
+        except Exception as exc:
+            print(f"[GUI] failed to fetch speaker_info for {uuid}: {exc!r}")
+            info = {}
+
+        style_infos: dict[int, dict[str, T.Any]] = {}
+        if isinstance(info, dict):
+            for style_info in info.get("style_infos", []):
+                sid = style_info.get("id")
+                try:
+                    sid_int = int(sid)
+                except Exception:
+                    continue
+                style_infos[sid_int] = style_info
+
+        styles = speaker.get("styles") or []
+        if not isinstance(styles, list):
+            styles = []
+
+        for style in styles:
+            sid = style.get("id")
+            if sid is None:
+                continue
+            try:
+                style_id = int(sid)
+            except Exception:
+                continue
+            style_name = style.get("name") or ""
+            speaker_name = speaker.get("name") or ""
+            combined_name = f"{speaker_name}({style_name})" if style_name else speaker_name
+            style_info = style_infos.get(style_id, {})
+            icon = _wrap_data_url(style_info.get("icon"), "image/png")
+            samples_raw = style_info.get("voice_samples") or []
+            sample_urls: list[dict[str, T.Any]] = []
+            if isinstance(samples_raw, list):
+                for idx, sample in enumerate(samples_raw):
+                    sample_url = _wrap_data_url(sample, "audio/wav")
+                    if sample_url:
+                        sample_urls.append({"index": idx, "url": sample_url})
+
+            compiled.append(
+                {
+                    "speaker_name": combined_name,
+                    "speaker_id": style_id,
+                    "speaker_uuid": uuid,
+                    "style_name": style_name,
+                    "icon": icon,
+                    "voice_samples": sample_urls,
+                }
+            )
+
+    compiled.sort(key=lambda x: (x["speaker_name"], x["speaker_id"]))
+
+    async with _gui_voicevox_cache_lock:
+        _gui_voicevox_cache["timestamp"] = time.time()
+        _gui_voicevox_cache["items"] = compiled
+    return compiled
+
+
+async def gui_voicevox_speakers_handler(request: web.Request):
+    """VOICEVOX の話者リストを返す。
+
+    Args:
+        request: aiohttp のリクエスト。
+
+    Returns:
+        話者情報を含む JSON レスポンス。
+    """
+    _ensure_gui_auth(request)
+    if TTS_PROVIDER != "voicevox":
+        return _gui_error(400, "provider_mismatch", "VOICEVOX を利用していません。")
+
+    keyword = (request.query.get("q") or "").strip().lower()
+    force_refresh = request.query.get("refresh") == "1"
+
+    speakers = await _gui_get_voicevox_speakers(force_refresh=force_refresh)
+    if keyword:
+        filtered: list[dict[str, T.Any]] = []
+        for item in speakers:
+            haystacks = [
+                item.get("speaker_name") or "",
+                item.get("style_name") or "",
+                item.get("speaker_uuid") or "",
+                str(item.get("speaker_id", "")),
+            ]
+            if any(keyword in str(h).lower() for h in haystacks):
+                filtered.append(item)
+        speakers = filtered
+
+    payload: dict[str, T.Any] = {"ok": True, "speakers": speakers, "total": len(speakers)}
+    if keyword:
+        payload["query"] = keyword
+    return web.json_response(payload, dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
+
+
+# === GUI Web API END ===
+
 async def ccfo_options_handler(request: web.Request):
     # プリフライトへ 200 応答 + CORS ヘッダ
     origin = request.headers.get("Origin")
@@ -3420,6 +4057,13 @@ async def _start_ccfo_web_server():
         web.options("/ccfolia_event", ccfo_options_handler),  # ← 追加
         web.get("/openapi.json", openapi_handler),
         web.get("/docs", docs_handler),
+        web.get("/api/gui/config", gui_config_handler),
+        web.get("/api/gui/users", gui_users_handler),
+        web.put("/api/gui/gtts/{guild_id}/{user_id}", gui_update_gtts_handler),
+        web.delete("/api/gui/gtts/{guild_id}/{user_id}", gui_delete_gtts_handler),
+        web.put("/api/gui/voicevox/{guild_id}/{user_id}", gui_update_voicevox_handler),
+        web.delete("/api/gui/voicevox/{guild_id}/{user_id}", gui_delete_voicevox_handler),
+        web.get("/api/gui/voicevox/speakers", gui_voicevox_speakers_handler),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
