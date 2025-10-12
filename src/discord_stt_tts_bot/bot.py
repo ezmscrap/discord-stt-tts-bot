@@ -132,6 +132,8 @@ _ensure_csv_with_header(
         "token_count",
         "estimated_cost_usd",
         "text_length",
+        "gain_factor",
+        "gate_frames",
     ],
 )
 _ensure_csv_with_header(
@@ -206,6 +208,8 @@ async def log_stt_metrics(
     token_count: int | None,
     estimated_cost: float | None,
     text_length: int,
+    gain_factor: float | None,
+    gate_frames: int | None,
 ):
     ts = datetime.now(timezone.utc).isoformat()
     row = [
@@ -221,6 +225,8 @@ async def log_stt_metrics(
         str(int(token_count)) if isinstance(token_count, (int, float)) else "",
         f"{estimated_cost:.6f}" if isinstance(estimated_cost, (int, float)) else "",
         str(int(text_length)) if isinstance(text_length, (int, float)) else "",
+        f"{gain_factor:.3f}" if isinstance(gain_factor, (int, float)) else "",
+        str(int(gate_frames)) if isinstance(gate_frames, (int, float)) else "",
     ]
     await _append_csv(STT_METRICS_PATH, row)
 
@@ -851,6 +857,90 @@ def _estimate_stt_cost(model: str, duration_sec: float) -> float:
     return minutes * float(rate)
 
 
+def _apply_gain_and_gate(wav_bytes: bytes, st: dict) -> tuple[bytes, dict | None]:
+    gain_enabled = st.get("gain_enable", False)
+    gate_enabled = st.get("gate_enable", False)
+    if not (gain_enabled or gate_enabled):
+        return wav_bytes, None
+
+    pcm = _wav_bytes_to_pcm16k(wav_bytes)
+    if not pcm:
+        return wav_bytes, None
+
+    pre_rms = audioop.rms(pcm, 2) / 32767.0 if pcm else 0.0
+
+    pcm_array = bytearray(pcm)
+    frame_samples = 320  # 20ms @16kHz
+    frame_bytes = frame_samples * 2
+    gate_frames_zeroed = 0
+
+    if gate_enabled:
+        threshold_db = float(st.get("gate_threshold_db", -55.0))
+        linear = 10.0 ** (threshold_db / 20.0)
+        amp_threshold = max(0, min(32767, int(linear * 32767)))
+        hold_ms = max(40.0, float(st.get("gate_hold_ms", 160.0)))
+        hold_frames = max(1, int(round(hold_ms / 20.0)))
+        silence_run = 0
+        gate_active = False
+        run_positions: list[int] = []
+
+        for start in range(0, len(pcm_array), frame_bytes):
+            frame = pcm_array[start:start + frame_bytes]
+            if len(frame) < frame_bytes:
+                break
+            rms = audioop.rms(frame, 2)
+            if rms < amp_threshold:
+                silence_run += 1
+                run_positions.append(start)
+            else:
+                silence_run = 0
+                run_positions.clear()
+                gate_active = False
+
+            if not gate_active and silence_run >= hold_frames:
+                gate_active = True
+                for pos in run_positions:
+                    segment = pcm_array[pos:pos + frame_bytes]
+                    if any(segment):
+                        pcm_array[pos:pos + frame_bytes] = b"\x00" * len(segment)
+                        gate_frames_zeroed += 1
+            elif gate_active and rms < amp_threshold:
+                if any(frame):
+                    pcm_array[start:start + frame_bytes] = b"\x00" * len(frame)
+                    gate_frames_zeroed += 1
+            elif gate_active and rms >= amp_threshold:
+                gate_active = False
+                run_positions.clear()
+
+    pcm_processed = bytes(pcm_array)
+    gain_applied = False
+    gain_factor = 1.0
+    if gain_enabled:
+        target_rms = max(1e-4, float(st.get("gain_target_rms", 0.06)))
+        max_gain = max(1.0, float(st.get("gain_max_gain", 6.0)))
+        current_rms = audioop.rms(pcm_processed, 2) / 32767.0 if pcm_processed else 0.0
+        if current_rms > 1e-4:
+            gain_factor = target_rms / current_rms
+            gain_factor = max(1.0, min(max_gain, gain_factor))
+            if gain_factor > 1.02:
+                pcm_processed = audioop.mul(pcm_processed, 2, gain_factor)
+                gain_applied = True
+
+    post_rms = audioop.rms(pcm_processed, 2) / 32767.0 if pcm_processed else 0.0
+
+    if gain_applied or gate_frames_zeroed > 0:
+        wav_bytes = _pcm16k_to_wav_bytes(pcm_processed)
+
+    info = dict(
+        pre_rms=pre_rms,
+        post_rms=post_rms,
+        gain_applied=gain_applied,
+        gain_factor=gain_factor,
+        gate_frames=gate_frames_zeroed,
+    )
+    return wav_bytes, info
+
+
 async def transcribe_and_post(src, channel, username: str):
     if not openai:
         print("[STT] OpenAI client is None"); return
@@ -1016,6 +1106,12 @@ def get_state(guild_id):
             lang="ja",
             stt_primary_model=DEFAULT_PRIMARY_STT_MODEL,
             stt_fallback_model=DEFAULT_FALLBACK_STT_MODEL,
+            gain_enable=True,
+            gain_target_rms=0.06,
+            gain_max_gain=6.0,
+            gate_enable=True,
+            gate_threshold_db=-55.0,
+            gate_hold_ms=160.0,
             use_thread=False,
             caption_dest_id=None,
             last_msgs={},
@@ -1031,6 +1127,9 @@ def get_state(guild_id):
                 total_duration=0.0,
                 total_cost=0.0,
                 model_usage=collections.Counter(),
+                gain_events=0,
+                gain_factor_sum=0.0,
+                gate_frames=0,
             ),
         )
     return guild_state[guild_id]
@@ -1549,6 +1648,14 @@ async def sttstats(ctx: commands.Context):
         top_models = usage.most_common(5)
         model_text = ", ".join(f"{name}:{count}" for name, count in top_models)
         lines.append(f"モデル使用回数: {model_text}")
+    gain_events = metrics.get("gain_events", 0)
+    if gain_events:
+        avg_gain = metrics.get("gain_factor_sum", 0.0) / max(1, gain_events)
+        lines.append(f"平均ゲイン係数: {avg_gain:.2f} （適用 {gain_events} 回）")
+    gate_frames = metrics.get("gate_frames", 0)
+    if gate_frames:
+        gate_seconds = gate_frames * 0.02
+        lines.append(f"ゲート無音化: {gate_frames}フレーム（約 {gate_seconds:.1f} 秒）")
     await ctx.reply("STT指標概要:\n" + "\n".join(lines))
 
 
@@ -2059,6 +2166,8 @@ async def sttset(ctx, key: str=None, value: str=None):
       !sttset thread on
       !sttset denoise on/off
       !sttset denoisemode arnndn
+      !sttset gaintarget 0.07
+      !sttset gate off
       !sttset sttmodel gpt-4o-mini-transcribe
       !sttset sttmodel2 gpt-4o-transcribe
     """
@@ -2070,6 +2179,7 @@ async def sttset(ctx, key: str=None, value: str=None):
                 "mindur={min_dur}s merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread} "
                 "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms "
                 "denoise={denoise_enable} dmode={denoise_mode} hp={denoise_highpass} lp={denoise_lowpass} strength={denoise_strength} gain={denoise_gain} "
+                "gain={gain_enable} gtarget={gain_target_rms} gmax={gain_max_gain} gate={gate_enable} gthreshold={gate_threshold_db} ghold={gate_hold_ms} "
                 "model={stt_primary_model} fallback={stt_fallback_model}"
             ).format(**st)
         )
@@ -2143,6 +2253,18 @@ async def sttset(ctx, key: str=None, value: str=None):
         elif k in ("denoisecomp", "dncomp"):
             st["denoise_compand"] = value
             st["denoise_ffmpeg_failed"] = False
+        elif k in ("gain", "agc"):
+            st["gain_enable"] = value.lower() in ("on", "true", "1", "yes", "y")
+        elif k in ("gaintarget", "gtarget"):
+            st["gain_target_rms"] = max(1e-4, float(value))
+        elif k in ("gainmax", "gmax"):
+            st["gain_max_gain"] = max(1.0, float(value))
+        elif k in ("gate", "noisegate"):
+            st["gate_enable"] = value.lower() in ("on", "true", "1", "yes", "y")
+        elif k in ("gatethresh", "gatethreshold", "gthreshold"):
+            st["gate_threshold_db"] = float(value)
+        elif k in ("gatehold", "ghold"):
+            st["gate_hold_ms"] = max(40.0, float(value))
         elif k in ("sttmodel", "model", "primarymodel"):
             if not value:
                 return await ctx.reply("モデル名を指定してください。例: gpt-4o-mini-transcribe")
@@ -2155,7 +2277,8 @@ async def sttset(ctx, key: str=None, value: str=None):
             return await ctx.reply(
                 "未知のキー: vad / vaddb / mindur / merge / mergeauto / lang / thread / "
                 "mode / window / vadlevel / vadsilence / vadpre / vadpost / vadoverlap / "
-                "denoise / denoisemode / denoisemodel / denoisehp / denoiselp / denoisestr / denoisegain / denoisecomp / sttmodel / sttmodel2"
+                "denoise / denoisemode / denoisemodel / denoisehp / denoiselp / denoisestr / denoisegain / denoisecomp / "
+                "gain / gaintarget / gainmax / gate / gatethresh / gatehold / sttmodel / sttmodel2"
             )
     except Exception as e:
         return await ctx.reply(f"設定失敗: {e!r}")
@@ -2166,6 +2289,7 @@ async def sttset(ctx, key: str=None, value: str=None):
             "mindur={min_dur}s merge={merge_window}s mergeauto={merge_auto} lang={lang} thread={use_thread} "
             "vadlevel={vad_aggressiveness} silence={vad_silence_ms}ms pre={vad_pre_ms}ms post={vad_post_ms}ms overlap={vad_overlap_ms}ms "
             "denoise={denoise_enable} dmode={denoise_mode} hp={denoise_highpass} lp={denoise_lowpass} strength={denoise_strength} gain={denoise_gain} "
+            "gain={gain_enable} gtarget={gain_target_rms} gmax={gain_max_gain} gate={gate_enable} gthreshold={gate_threshold_db} ghold={gate_hold_ms} "
             "model={stt_primary_model} fallback={stt_fallback_model}"
         ).format(**st)
     )
@@ -2458,6 +2582,12 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
         print("[STT] OpenAI client is None"); return
     st = get_state(guild_id)
 
+    gain_info = None
+    try:
+        buf, gain_info = _apply_gain_and_gate(buf, st)
+    except Exception:
+        traceback.print_exc()
+
     try:
         processed = await _maybe_denoise_wav(buf, st)
         if processed:
@@ -2568,6 +2698,8 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
         token_count=token_count if isinstance(token_count, (int, float)) else None,
         estimated_cost=estimated_cost,
         text_length=len(text or ""),
+        gain_factor=(gain_info or {}).get("gain_factor"),
+        gate_frames=(gain_info or {}).get("gate_frames"),
     )
 
     metrics_state = st.get("stt_metrics")
@@ -2582,6 +2714,11 @@ async def transcribe_and_post_from_bytes(guild_id: int, user_id: int, username: 
             usage[used_model or "unknown"] += 1
         else:
             metrics_state["model_usage"] = collections.Counter({used_model or "unknown": 1})
+        if gain_info:
+            if gain_info.get("gain_applied"):
+                metrics_state["gain_events"] = metrics_state.get("gain_events", 0) + 1
+                metrics_state["gain_factor_sum"] = metrics_state.get("gain_factor_sum", 0.0) + float(gain_info.get("gain_factor", 1.0))
+            metrics_state["gate_frames"] = metrics_state.get("gate_frames", 0) + int(gain_info.get("gate_frames", 0))
 
     # キャプション投稿（連投マージ対応）
     await post_caption(guild_id, channel, user_id, username, jp_cleanup(text))
@@ -2783,7 +2920,7 @@ async def help_command(ctx: commands.Context, *, command_name: str = None):
 
     # 見やすい順に並べ替え（お好みで）
     order = ["join","leave","readon","readoff","readhere","stton","sttoff",
-             "stttest","rectest","diag","logs","whereami","intentcheck","sttset",
+             "stttest","rectest","diag","logs","whereami","intentcheck","sttset","sttstats",
              "sttcolor","sttpalette","voicevoxstyles","voxdict","ttsspeed","ttsvoice","ttsconfig","ttsspeaker"]
     sort_key = {name:i for i,name in enumerate(order)}
     visible_items.sort(key=lambda x: sort_key.get(x["name"], 999))

@@ -122,6 +122,7 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 - `!stton [vad|fixed] [3-60]` … 文字起こしを開始します。例: `!stton`, `!stton fixed 8`
 - `!sttoff` … 文字起こしを停止します。例: `!sttoff`
 - `!sttset ...` … STT 設定を調整します。例: `!sttset vad 0.008`, `!sttset vadlevel 3`, `!sttset sttmodel gpt-4o-mini-transcribe`
+- 小声に強くする: `!sttset gaintarget 0.07`, `!sttset gate off`
 - `!sttstats` … モデル使用回数やフォールバック率・推定コストを確認します。例: `!sttstats`
 - `!sttcolor ...` … 字幕カラーを管理します。例: `!sttcolor @自分 3`
 - `!sttpalette` … 字幕カラーのパレットをプレビューします。例: `!sttpalette`
@@ -217,6 +218,8 @@ nohup python -m discord_stt_tts_bot > bot.log 2>&1 &
   - `ARNNDN_MODEL_PATH` を設定すると、FFmpeg `arnndn` モデルを明示できます（未設定時は自動で `afftdn` にフォールバックします）。
 - **モデル切り替えの効果を見たい**
   - `logs` コマンドで `stt_metrics.csv` を取得すると、各モデルの使用状況や推定コストが確認できます。サーバー内では `!sttstats` で要約を表示できます。
+- **小声が拾われにくい**
+  - `!sttset gaintarget 0.07` や `!sttset gainmax 8` で自動ゲインを強められます。ノイズが増える場合は `!sttset gate on` / `gatethresh -60` でゲートを緩めて調整してください。
 
 ---
 
