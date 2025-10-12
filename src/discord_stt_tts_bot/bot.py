@@ -3184,6 +3184,197 @@ def _cors_headers(origin: str | None) -> dict:
         "Access-Control-Allow-Private-Network": "true",
     }
 
+
+def _build_openapi_spec(request: web.Request | None = None) -> dict[str, T.Any]:
+    if request is not None and request.host:
+        server_url = f"{request.scheme}://{request.host}"
+    else:
+        server_url = f"http://{CCFO_HOST}:{CCFO_PORT}"
+    post_security = [{"CCFToken": []}] if CCFO_SECRET else []
+    return {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Discord STT/TTS Bot Bridge API",
+            "version": "0.1.0",
+            "description": (
+                "Discord STT/TTS Bot が提供する CCFOLIA ブリッジ向けエンドポイントの仕様です。\n"
+                "C.C.FOLIA などの外部ツールから Discord へイベントを転送するために利用します。"
+            ),
+        },
+        "servers": [{"url": server_url}],
+        "paths": {
+            "/ccfolia_event": {
+                "post": {
+                    "tags": ["CCFOLIA Bridge"],
+                    "summary": "テキストイベントの送信",
+                    "description": (
+                        "C.C.FOLIA などから取得したイベントを Discord へ転送するためのキューに積みます。"
+                        " `CCFOLIA_POST_SECRET` が設定されている場合は `X-CCF-Token` ヘッダで一致するトークンを送信してください。"
+                        " 未設定の場合、トークンヘッダは省略できます。"
+                    ),
+                    "security": post_security,
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/CCFoliaEventRequest"},
+                                "example": {
+                                    "speaker": "PL1",
+                                    "text": "ダイス 1D100 → 27",
+                                    "room": "卓名",
+                                    "ts_client": "ccfolia-sync",
+                                },
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "キュー投入に成功しました。",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/GenericOkResponse"}
+                                }
+                            },
+                        },
+                        "400": {
+                            "description": "入力値が不正です（JSON 解析失敗や text の未指定など）。",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"},
+                                    "examples": {
+                                        "invalid_json": {
+                                            "summary": "JSON フォーマット誤り",
+                                            "value": {"ok": False, "error": "invalid_json"},
+                                        },
+                                        "empty_text": {
+                                            "summary": "text が空",
+                                            "value": {"ok": False, "error": "empty_text"},
+                                        },
+                                    },
+                                }
+                            },
+                        },
+                        "401": {
+                            "description": "認証に失敗しました。",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"},
+                                    "example": {"ok": False, "error": "bad_token"},
+                                }
+                            },
+                        },
+                        "403": {
+                            "description": "許可されていない IP アドレスからのアクセスです。",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"},
+                                    "example": {"ok": False, "error": "forbidden_ip"},
+                                }
+                            },
+                        },
+                    },
+                },
+                "options": {
+                    "tags": ["CCFOLIA Bridge"],
+                    "summary": "CORS プリフライト",
+                    "description": "ブラウザからのアクセス時に必要な CORS プリフライト要求へ応答します。",
+                    "responses": {
+                        "200": {
+                            "description": "CORS 設定を示すレスポンスを返します。"
+                        }
+                    },
+                },
+            }
+        },
+        "components": {
+            "securitySchemes": {
+                "CCFToken": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-CCF-Token",
+                    "description": "CCFOLIA_POST_SECRET の値と一致するトークン。未設定時は不要です。",
+                }
+            },
+            "schemas": {
+                "CCFoliaEventRequest": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "speaker": {
+                            "type": "string",
+                            "description": "Discord に送信する表示名。省略時は（未指定）。",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Discord に送信する本文。",
+                        },
+                        "room": {
+                            "type": "string",
+                            "description": "任意のルーム名やセッション名。",
+                        },
+                        "ts_client": {
+                            "type": "string",
+                            "description": "送信元クライアント識別子。",
+                        },
+                    },
+                    "required": ["text"],
+                },
+                "GenericOkResponse": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "ok": {"type": "boolean", "example": True},
+                    },
+                    "required": ["ok"],
+                },
+                "ErrorResponse": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "ok": {"type": "boolean", "example": False},
+                        "error": {
+                            "type": "string",
+                            "description": "エラー種別コード。",
+                        },
+                    },
+                    "required": ["ok", "error"],
+                },
+            },
+        },
+    }
+
+
+async def openapi_handler(request: web.Request):
+    return web.json_response(_build_openapi_spec(request))
+
+
+async def docs_handler(request: web.Request):
+    spec_url = f"{request.scheme}://{request.host}/openapi.json"
+    html = f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Discord STT/TTS Bot API Docs</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.onload = () => {{
+      SwaggerUIBundle({{
+        url: "{spec_url}",
+        dom_id: '#swagger-ui',
+        presets: [SwaggerUIBundle.presets.apis],
+        layout: "BaseLayout"
+      }});
+    }};
+  </script>
+</body>
+</html>"""
+    return web.Response(text=html, content_type="text/html")
+
+
 async def ccfo_options_handler(request: web.Request):
     # プリフライトへ 200 応答 + CORS ヘッダ
     origin = request.headers.get("Origin")
@@ -3227,6 +3418,8 @@ async def _start_ccfo_web_server():
     app.add_routes([
         web.post("/ccfolia_event", ccfo_post_handler),
         web.options("/ccfolia_event", ccfo_options_handler),  # ← 追加
+        web.get("/openapi.json", openapi_handler),
+        web.get("/docs", docs_handler),
     ])
     runner = web.AppRunner(app)
     await runner.setup()

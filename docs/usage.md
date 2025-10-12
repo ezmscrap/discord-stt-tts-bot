@@ -110,6 +110,84 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 
 ---
 
+## Web API
+
+Bot と C.C.FOLIA 等の連携システムとの間でイベントをやり取りするためのローカル API を提供しています。
+
+- `POST /ccfolia_event` … イベントをキューへ投入し、指定チャンネルへ転送します。
+- `OPTIONS /ccfolia_event` … ブラウザ向けの CORS プリフライト応答です。
+- `GET /openapi.json` … OpenAPI(Swagger) 形式の仕様書を JSON で取得します。
+- `GET /docs` … Swagger UI によるインタラクティブな API ドキュメントを表示します。
+
+`CCFOLIA_POST_SECRET` を設定している場合、`POST /ccfolia_event` には `X-CCF-Token` ヘッダで同じ値を送信してください。未設定であればヘッダは不要です。IP 制限は `CCFOLIA_ACCEPT_FROM` で制御します。
+
+### Swagger UI
+
+Web サーバー起動後、`http://<ホスト>:<ポート>/docs` にアクセスすると Swagger UI で仕様とサンプルが確認できます。仕様の JSON は `/openapi.json` から取得できます。
+
+### OpenAPI 抜粋
+
+以下はトークンを利用する構成（`CCFOLIA_POST_SECRET` を設定した場合）の例です。
+
+```yaml
+openapi: 3.0.3
+info:
+  title: Discord STT/TTS Bot Bridge API
+  version: 0.1.0
+paths:
+  /ccfolia_event:
+    post:
+      summary: テキストイベントの送信
+      description: >
+        C.C.FOLIA などから取得したイベントを Discord へ転送するためのキューに積みます。
+        CCFOLIA_POST_SECRET を設定している場合は X-CCF-Token ヘッダで同じ値を送信してください。
+      security:
+        - CCFToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CCFoliaEventRequest'
+      responses:
+        '200':
+          description: キュー投入に成功しました。
+        '400':
+          description: JSON 解析失敗や text の未指定など。
+        '401':
+          description: トークン不一致。
+        '403':
+          description: 許可されていない IP からのアクセス。
+    options:
+      summary: CORS プリフライト
+components:
+  securitySchemes:
+    CCFToken:
+      type: apiKey
+      in: header
+      name: X-CCF-Token
+  schemas:
+    CCFoliaEventRequest:
+      type: object
+      required:
+        - text
+      properties:
+        speaker:
+          type: string
+          description: Discord に送信する表示名。省略時は（未指定）。
+        text:
+          type: string
+          description: Discord に送信する本文。
+        room:
+          type: string
+          description: 任意のルーム名やセッション名。
+        ts_client:
+          type: string
+          description: 送信元クライアント識別子。
+```
+
+---
+
 ## コマンド一覧（抜粋）
 
 ### 基本操作
