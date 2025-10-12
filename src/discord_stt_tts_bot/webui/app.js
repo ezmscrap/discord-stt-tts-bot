@@ -553,51 +553,60 @@ function createUserCard(user) {
 
   const title = document.createElement("h3");
   title.className = "user-card__title";
-  title.textContent = user.user_name || "(名称未設定)";
+  title.textContent = user.user_name || user.user_display || "(名称未設定)";
   header.appendChild(title);
 
   const idGroup = document.createElement("div");
   idGroup.className = "user-card__ids";
-  const candidateIds = Array.isArray(user.candidate_user_ids) ? user.candidate_user_ids : [];
-  if (candidateIds.length) {
-    for (const id of candidateIds) {
-      idGroup.appendChild(createBadge(`ID ${id}`, "badge--id"));
-    }
+  if (user.user_id != null) {
+    idGroup.appendChild(createBadge(`user_id ${user.user_id}`, "badge--id"));
   } else {
-    idGroup.appendChild(createBadge("ID未検出", "badge"));
+    idGroup.appendChild(createBadge("user_id 未登録", "badge"));
   }
+  idGroup.appendChild(createBadge(`author_id ${user.author_id}`, "badge--author"));
   header.appendChild(idGroup);
 
   const meta = document.createElement("div");
   meta.className = "user-card__meta";
-  if (Array.isArray(user.user_displays) && user.user_displays.length) {
-    meta.appendChild(createMetaRow("user_display", user.user_displays, "badge--display"));
+  if (user.user_display) {
+    meta.appendChild(createMetaRow("user_display", [user.user_display], "badge--display"));
   }
-  if (Array.isArray(user.author_displays) && user.author_displays.length) {
-    meta.appendChild(createMetaRow("author_display", user.author_displays, "badge--author"));
+  if (user.author_display) {
+    meta.appendChild(createMetaRow("author_display", [user.author_display], "badge--author"));
   }
-  const gttsEntries = Object.entries(user.gtts_overrides || {});
-  if (gttsEntries.length) {
-    const values = gttsEntries.map(([id, cfg]) => {
-      const semi = Number.parseFloat(cfg.semitones).toFixed(1);
-      const tempo = Number.parseFloat(cfg.tempo).toFixed(2);
-      return `${id}: ${semi} / ${tempo}`;
-    });
-    meta.appendChild(createMetaRow("gTTS個別", values, "badge--gtts"));
+  if (typeof user.speaker_id === "number") {
+    meta.appendChild(
+      createMetaRow("speaker_id", [String(user.speaker_id)], "badge--voicevox"),
+    );
   }
-  const voicevoxEntries = Object.entries(user.voicevox_speakers || {});
-  if (voicevoxEntries.length) {
-    const values = voicevoxEntries.map(([id, speakerId]) => `${id}: ${speakerId}`);
-    meta.appendChild(createMetaRow("VOICEVOX個別", values, "badge--voicevox"));
+  if (user.gtts_override) {
+    const override = user.gtts_override;
+    meta.appendChild(
+      createMetaRow(
+        "gTTS",
+        [
+          `semitones ${Number.parseFloat(override.semitones).toFixed(1)}`,
+          `tempo ${Number.parseFloat(override.tempo).toFixed(2)}`,
+        ],
+        "badge--gtts",
+      ),
+    );
   }
 
   const actions = document.createElement("div");
   actions.className = "user-card__actions";
   const provider = state.config?.provider || "";
   if (provider === "gtts") {
-    actions.appendChild(createGttsControl(user, candidateIds));
+    if (user.user_id != null) {
+      actions.appendChild(createGttsControl(user));
+    } else {
+      const note = document.createElement("div");
+      note.className = "notice";
+      note.textContent = "gTTS 個別設定は user_id が取得できないため利用できません。";
+      actions.appendChild(note);
+    }
   } else if (provider === "voicevox") {
-    actions.appendChild(createVoicevoxControl(user, candidateIds));
+    actions.appendChild(createVoicevoxControl(user));
   } else {
     const note = document.createElement("div");
     note.className = "notice";
@@ -662,35 +671,20 @@ function speakerNameById(speakerId) {
 /**
  * gTTS 個別設定フォームを生成する。
  * @param {any} user 対象ユーザ情報。
- * @param {Array<number>} candidateIds 候補となるユーザID一覧。
  * @returns {HTMLElement} レンダリング用ノード。
  */
-function createGttsControl(user, candidateIds) {
+function createGttsControl(user) {
   const container = document.createElement("div");
   container.className = "user-card__control";
 
-  if (!candidateIds.length) {
-    const note = document.createElement("div");
-    note.className = "alert";
-    note.textContent = "適用可能なユーザIDが見つかりません。ログ取得後に再度お試しください。";
-    container.appendChild(note);
-    return container;
-  }
-
   const form = document.createElement("form");
   form.className = "gtts-form";
+  form.dataset.userId = String(user.user_id);
 
-  const selectWrapper = document.createElement("label");
-  selectWrapper.textContent = "対象ユーザ ID";
-  const select = document.createElement("select");
-  select.name = "user-id";
-  for (const id of candidateIds) {
-    const option = document.createElement("option");
-    option.value = String(id);
-    option.textContent = String(id);
-    select.appendChild(option);
-  }
-  selectWrapper.appendChild(select);
+  const info = document.createElement("div");
+  info.className = "notice";
+  info.textContent = `対象: user_id ${user.user_id}`;
+  form.appendChild(info);
 
   const semitoneWrapper = document.createElement("label");
   semitoneWrapper.textContent = "半音 (semitones)";
@@ -700,7 +694,9 @@ function createGttsControl(user, candidateIds) {
   semitoneInput.step = "0.1";
   semitoneInput.min = "-24";
   semitoneInput.max = "24";
-  semitoneInput.value = "0";
+  semitoneInput.value = user.gtts_override
+    ? Number.parseFloat(user.gtts_override.semitones).toFixed(1)
+    : "0.0";
   semitoneWrapper.appendChild(semitoneInput);
 
   const tempoWrapper = document.createElement("label");
@@ -711,7 +707,9 @@ function createGttsControl(user, candidateIds) {
   tempoInput.step = "0.05";
   tempoInput.min = "0.5";
   tempoInput.max = "3.0";
-  tempoInput.value = "1.0";
+  tempoInput.value = user.gtts_override
+    ? Number.parseFloat(user.gtts_override.tempo).toFixed(2)
+    : "1.0";
   tempoWrapper.appendChild(tempoInput);
 
   const actions = document.createElement("div");
@@ -729,47 +727,26 @@ function createGttsControl(user, candidateIds) {
 
   actions.append(submit, resetButton);
 
-  form.append(selectWrapper, semitoneWrapper, tempoWrapper, actions);
-
-  const syncInputs = () => {
-    const current = user.gtts_overrides?.[select.value];
-    if (current) {
-      semitoneInput.value = Number.parseFloat(current.semitones).toFixed(1);
-      tempoInput.value = Number.parseFloat(current.tempo).toFixed(2);
-    } else {
-      semitoneInput.value = "0.0";
-      tempoInput.value = "1.0";
-    }
-  };
-  syncInputs();
-
-  select.addEventListener("change", () => {
-    syncInputs();
-  });
+  form.append(semitoneWrapper, tempoWrapper, actions);
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const userId = Number.parseInt(select.value, 10);
     const semitones = Number.parseFloat(semitoneInput.value);
     const tempo = Number.parseFloat(tempoInput.value);
-    if (Number.isNaN(userId) || Number.isNaN(semitones) || Number.isNaN(tempo)) {
+    if (Number.isNaN(semitones) || Number.isNaN(tempo)) {
       state.userError = "半音・テンポはいずれも数値で指定してください。";
       render();
       return;
     }
     state.userMessage = "保存中...";
     render();
-    await handleGttsSubmit(userId, semitones, tempo);
+    await handleGttsSubmit(user, semitones, tempo);
   });
 
   resetButton.addEventListener("click", async () => {
-    const userId = Number.parseInt(select.value, 10);
-    if (Number.isNaN(userId)) {
-      return;
-    }
     state.userMessage = "リセット中...";
     render();
-    await handleGttsReset(userId);
+    await handleGttsReset(user);
   });
 
   container.appendChild(form);
@@ -779,40 +756,17 @@ function createGttsControl(user, candidateIds) {
 /**
  * VOICEVOX 向けコントロールのプレースホルダーを生成する。
  * @param {any} user 対象ユーザ情報。
- * @param {Array<number>} candidateIds 候補となるユーザID一覧。
  * @returns {HTMLElement} レンダリング用ノード。
  */
-function createVoicevoxControl(user, candidateIds) {
+function createVoicevoxControl(user) {
   const container = document.createElement("div");
   container.className = "user-card__control";
+  const primarySpeakerId = user.speaker_id;
 
-  const overridesSource = user.voicevox_speakers || {};
-  const primaryUserIdRaw = user.voicevox_primary_user_id;
-  const primarySpeakerIdRaw = user.voicevox_primary_speaker_id;
-  const candidateList = Array.from(new Set(candidateIds));
-  const overrides = { ...overridesSource };
-
-  if (typeof primaryUserIdRaw === "number" && !Number.isNaN(primaryUserIdRaw)) {
-    if (!candidateList.includes(primaryUserIdRaw)) {
-      candidateList.push(primaryUserIdRaw);
-    }
-    if (
-      typeof primarySpeakerIdRaw === "number" &&
-      !Number.isNaN(primarySpeakerIdRaw)
-    ) {
-      overrides[String(primaryUserIdRaw)] = primarySpeakerIdRaw;
-    }
-  }
-
-  candidateList.sort((a, b) => a - b);
-
-  if (!candidateList.length) {
-    const note = document.createElement("div");
-    note.className = "alert";
-    note.textContent = "適用可能なユーザIDが見つかりません。ログ取得後に再度お試しください。";
-    container.appendChild(note);
-    return container;
-  }
+  const info = document.createElement("div");
+  info.className = "notice";
+  info.textContent = `対象: author_id ${user.author_id}`;
+  container.appendChild(info);
 
   if (state.speakerLoading) {
     const note = document.createElement("div");
@@ -832,32 +786,6 @@ function createVoicevoxControl(user, candidateIds) {
 
   const form = document.createElement("form");
   form.className = "voicevox-form";
-
-  const userLabel = document.createElement("label");
-  userLabel.textContent = "対象ユーザ ID";
-  const userSelect = document.createElement("select");
-  userSelect.name = "user-id";
-  const primaryUserId =
-    typeof primaryUserIdRaw === "number" && !Number.isNaN(primaryUserIdRaw)
-      ? String(primaryUserIdRaw)
-      : null;
-  let initialUserId = primaryUserId;
-  if (!initialUserId) {
-    initialUserId = candidateList
-      .map((id) => String(id))
-      .find((id) => overrides[id] !== undefined);
-  }
-  if (!initialUserId) {
-    initialUserId = String(candidateList[0]);
-  }
-  for (const id of candidateList) {
-    const option = document.createElement("option");
-    option.value = String(id);
-    option.textContent = String(id);
-    userSelect.appendChild(option);
-  }
-  userSelect.value = initialUserId;
-  userLabel.appendChild(userSelect);
 
   const speakerLabel = document.createElement("label");
   speakerLabel.textContent = "話者";
@@ -887,7 +815,7 @@ function createVoicevoxControl(user, candidateIds) {
   resetButton.textContent = "リセット";
   actions.append(submit, resetButton);
 
-  form.append(userLabel, speakerLabel, actions);
+  form.append(speakerLabel, actions);
 
   const currentInfo = document.createElement("div");
   currentInfo.className = "user-card__current-speaker";
@@ -895,44 +823,27 @@ function createVoicevoxControl(user, candidateIds) {
   const selectionHint = document.createElement("div");
   selectionHint.className = "user-card__selection-hint";
 
-  const syncCurrent = () => {
-    let currentMapping = overrides[userSelect.value];
-    if (currentMapping === undefined && user.voicevox_primary_user_id != null) {
-      if (String(user.voicevox_primary_user_id) === userSelect.value) {
-        currentMapping = user.voicevox_primary_speaker_id;
-      }
+  const currentSpeakerId =
+    typeof primarySpeakerId === "number" && !Number.isNaN(primarySpeakerId)
+      ? String(primarySpeakerId)
+      : "";
+  if (currentSpeakerId) {
+    if (!Array.from(speakerSelect.options).some((opt) => opt.value === currentSpeakerId)) {
+      const missingOption = document.createElement("option");
+      missingOption.value = currentSpeakerId;
+      missingOption.textContent = `${speakerNameById(Number.parseInt(currentSpeakerId, 10))} (ID: ${currentSpeakerId})`;
+      speakerSelect.appendChild(missingOption);
     }
-    if (currentMapping !== undefined && currentMapping !== null) {
-      const parsed = Number.parseInt(currentMapping, 10);
-      const value = String(currentMapping);
-      if (!Array.from(speakerSelect.options).some((opt) => opt.value === value)) {
-        const missingOption = document.createElement("option");
-        missingOption.value = value;
-        missingOption.textContent = `${speakerNameById(parsed)} (ID: ${value})`;
-        speakerSelect.appendChild(missingOption);
-      }
-      speakerSelect.value = value;
-      currentInfo.textContent = `現在: ${speakerNameById(parsed)} (ID: ${parsed})`;
-      selectionHint.textContent = "";
-    } else {
-      speakerSelect.value = "";
-      const defaultId = state.config?.default_voicevox_speaker;
-      const defaultName =
-        typeof defaultId === "number" ? speakerNameById(defaultId) : "未設定";
-      if (typeof defaultId === "number") {
-        currentInfo.textContent = `現在: デフォルト (${defaultId}) / ${defaultName}`;
-      } else {
-        currentInfo.textContent = "現在: デフォルト話者 (未設定)";
-      }
-      selectionHint.textContent = "";
-    }
-  };
-
-  syncCurrent();
-
-  userSelect.addEventListener("change", () => {
-    syncCurrent();
-  });
+    speakerSelect.value = currentSpeakerId;
+    currentInfo.textContent = `現在: ${speakerNameById(Number.parseInt(currentSpeakerId, 10))} (ID: ${currentSpeakerId})`;
+  } else {
+    const defaultId = state.config?.default_voicevox_speaker;
+    const defaultName = typeof defaultId === "number" ? speakerNameById(defaultId) : "未設定";
+    currentInfo.textContent =
+      typeof defaultId === "number"
+        ? `現在: デフォルト (${defaultId}) / ${defaultName}`
+        : "現在: デフォルト話者 (未設定)";
+  }
 
   speakerSelect.addEventListener("change", () => {
     if (!speakerSelect.value) {
@@ -945,13 +856,7 @@ function createVoicevoxControl(user, candidateIds) {
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const userId = Number.parseInt(userSelect.value, 10);
     const speakerId = Number.parseInt(speakerSelect.value, 10);
-    if (Number.isNaN(userId)) {
-      state.userError = "ユーザIDを正しく選択してください。";
-      render();
-      return;
-    }
     if (Number.isNaN(speakerId)) {
       state.userError = "設定する話者を選択してください。";
       render();
@@ -959,17 +864,13 @@ function createVoicevoxControl(user, candidateIds) {
     }
     state.userMessage = "VOICEVOX 話者を保存中...";
     render();
-    await handleVoicevoxSubmit(userId, speakerId);
+    await handleVoicevoxSubmit(user, speakerId);
   });
 
   resetButton.addEventListener("click", async () => {
-    const userId = Number.parseInt(userSelect.value, 10);
-    if (Number.isNaN(userId)) {
-      return;
-    }
     state.userMessage = "VOICEVOX 話者をリセット中...";
     render();
-    await handleVoicevoxReset(userId);
+    await handleVoicevoxReset(user);
   });
 
   container.append(form, currentInfo, selectionHint);
@@ -978,17 +879,15 @@ function createVoicevoxControl(user, candidateIds) {
 
 /**
  * gTTS 設定の保存を実行する。
- * @param {number} userId 対象ユーザID。
+ * @param {any} user 対象ユーザ情報。
  * @param {number} semitones 半音設定。
  * @param {number} tempo テンポ設定。
  * @returns {Promise<void>}
  */
-async function handleGttsSubmit(userId, semitones, tempo) {
-  if (!state.config) {
-    return;
-  }
+async function handleGttsSubmit(user, semitones, tempo) {
+  const guildId = state.config?.guild_id ?? 0;
   try {
-    const response = await apiFetch(`/api/gui/gtts/${state.config.guild_id}/${userId}`, {
+    const response = await apiFetch(`/api/gui/gtts/${guildId}/${user.user_id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ semitones, tempo }),
@@ -1017,12 +916,10 @@ async function handleGttsSubmit(userId, semitones, tempo) {
  * @param {number} userId 対象ユーザID。
  * @returns {Promise<void>}
  */
-async function handleGttsReset(userId) {
-  if (!state.config) {
-    return;
-  }
+async function handleGttsReset(user) {
+  const guildId = state.config?.guild_id ?? 0;
   try {
-    const response = await apiFetch(`/api/gui/gtts/${state.config.guild_id}/${userId}`, {
+    const response = await apiFetch(`/api/gui/gtts/${guildId}/${user.user_id}`, {
       method: "DELETE",
     });
     if (response.status === 401) {
@@ -1046,21 +943,24 @@ async function handleGttsReset(userId) {
 
 /**
  * VOICEVOX 話者設定の保存を実行する。
- * @param {number} userId 対象ユーザID。
+ * @param {any} user 対象ユーザ情報。
  * @param {number} speakerId 設定する話者ID。
  * @returns {Promise<void>}
  */
-async function handleVoicevoxSubmit(userId, speakerId) {
-  if (!state.config) {
-    return;
-  }
+async function handleVoicevoxSubmit(user, speakerId) {
   try {
     const response = await apiFetch(
-      `/api/gui/voicevox/${state.config.guild_id}/${userId}`,
+      `/api/gui/voicevox/0/${user.author_id}`,
       {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ speaker_id: speakerId }),
+        body: JSON.stringify({
+          speaker_id: speakerId,
+          author_id: user.author_id,
+          user_id: user.user_id,
+          author_display: user.author_display || "",
+          user_display: user.user_display || "",
+        }),
       },
     );
     if (response.status === 401) {
@@ -1084,16 +984,13 @@ async function handleVoicevoxSubmit(userId, speakerId) {
 
 /**
  * VOICEVOX 話者設定のリセットを実行する。
- * @param {number} userId 対象ユーザID。
+ * @param {any} user 対象ユーザ情報。
  * @returns {Promise<void>}
  */
-async function handleVoicevoxReset(userId) {
-  if (!state.config) {
-    return;
-  }
+async function handleVoicevoxReset(user) {
   try {
     const response = await apiFetch(
-      `/api/gui/voicevox/${state.config.guild_id}/${userId}`,
+      `/api/gui/voicevox/0/${user.author_id}`,
       { method: "DELETE" },
     );
     if (response.status === 401) {

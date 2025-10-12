@@ -3714,32 +3714,32 @@ def _build_openapi_spec(request: web.Request | None = None) -> dict[str, T.Any]:
                 "GuiUserEntry": {
                     "type": "object",
                     "properties": {
-                        "user_name": {"type": "string"},
-                        "user_displays": {"type": "array", "items": {"type": "string"}},
-                        "author_displays": {"type": "array", "items": {"type": "string"}},
+                        "user_name": {"type": ["string", "null"]},
+                        "user_id": {"type": "integer"},
+                        "author_id": {"type": "integer"},
+                        "user_display": {"type": "string"},
+                        "author_display": {"type": "string"},
+                        "speaker_id": {"type": ["integer", "null"]},
+                        "gtts_override": {
+                            "oneOf": [
+                                {"type": "null"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "semitones": {"type": "number", "format": "float"},
+                                        "tempo": {"type": "number", "format": "float"},
+                                    },
+                                    "required": ["semitones", "tempo"],
+                                    "additionalProperties": False,
+                                },
+                            ]
+                        },
                         "user_ids": {"type": "array", "items": {"type": "integer"}},
                         "author_ids": {"type": "array", "items": {"type": "integer"}},
                         "candidate_user_ids": {"type": "array", "items": {"type": "integer"}},
                         "guild_ids": {"type": "array", "items": {"type": "integer"}},
-                        "gtts_overrides": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "object",
-                                "properties": {
-                                    "semitones": {"type": "number", "format": "float"},
-                                    "tempo": {"type": "number", "format": "float"},
-                                },
-                                "required": ["semitones", "tempo"],
-                            },
-                        },
-                        "voicevox_speakers": {
-                            "type": "object",
-                            "additionalProperties": {"type": "integer"},
-                        },
-                        "voicevox_primary_user_id": {"type": ["integer", "null"]},
-                        "voicevox_primary_speaker_id": {"type": ["integer", "null"]},
                     },
-                    "required": ["user_name", "candidate_user_ids"],
+                    "required": ["user_id", "author_id", "user_display", "author_display"],
                     "additionalProperties": False,
                 },
                 "VoicevoxSpeakerListResponse": {
@@ -3807,7 +3807,12 @@ def _build_openapi_spec(request: web.Request | None = None) -> dict[str, T.Any]:
                     "properties": {
                         "speaker_id": {"type": "integer"},
                         "reset": {"type": "boolean"},
+                        "author_id": {"type": "integer"},
+                        "user_id": {"type": "integer"},
+                        "author_display": {"type": "string"},
+                        "user_display": {"type": "string"},
                     },
+                    "required": ["author_id"],
                     "additionalProperties": False,
                 },
                 "VoicevoxUpdateResponse": {
@@ -3815,6 +3820,10 @@ def _build_openapi_spec(request: web.Request | None = None) -> dict[str, T.Any]:
                     "properties": {
                         "ok": {"type": "boolean", "example": True},
                         "speaker_id": {"type": ["integer", "null"]},
+                        "author_id": {"type": ["integer", "null"]},
+                        "user_id": {"type": ["integer", "null"]},
+                        "author_display": {"type": ["string", "null"]},
+                        "user_display": {"type": ["string", "null"]},
                     },
                     "required": ["ok"],
                 },
@@ -4223,117 +4232,105 @@ async def gui_users_handler(request: web.Request):
     keyword = (request.query.get("q") or "").strip()
     filtered = [entry for entry in entries if _gui_entry_matches_keyword(entry, keyword)]
 
-    state = get_state(guild_id) if guild_id else None
-    users = [_gui_enrich_entry_with_state(entry, state) for entry in filtered]
+    def _to_int_list(values: T.Iterable[T.Any] | None) -> list[int]:
+        result: list[int] = []
+        if not values:
+            return result
+        for raw in values:
+            try:
+                result.append(int(raw))
+            except Exception:
+                continue
+        return result
 
-    if state:
-        # 既存エントリを user_id -> entry にマッピング
-        user_map: dict[int, dict[str, T.Any]] = {}
-        overrides_state = state.get("tts_overrides", {}) or {}
-        speakers_state = state.get("tts_speakers", {}) or {}
-
-        for entry in users:
-            candidate_ids: list[int] = []
-            for raw_id in entry.get("candidate_user_ids", []):
-                try:
-                    candidate_ids.append(int(raw_id))
-                except Exception:
-                    continue
-            entry["candidate_user_ids"] = sorted(set(candidate_ids))
-
-            # user_ids / author_ids も整数化（存在する場合）
-            normalized_user_ids: list[int] = []
-            for raw_id in entry.get("user_ids", []):
-                try:
-                    normalized_user_ids.append(int(raw_id))
-                except Exception:
-                    continue
-            entry["user_ids"] = sorted(set(normalized_user_ids))
-
-            normalized_author_ids: list[int] = []
-            for raw_id in entry.get("author_ids", []):
-                try:
-                    normalized_author_ids.append(int(raw_id))
-                except Exception:
-                    continue
-            entry["author_ids"] = sorted(set(normalized_author_ids))
-
-            entry.setdefault("gtts_overrides", {})
-            entry.setdefault("voicevox_speakers", {})
-
-            for uid in entry["candidate_user_ids"]:
-                user_map[uid] = entry
-
-        def _ensure_entry(uid: int) -> dict[str, T.Any]:
-            entry = user_map.get(uid)
-            if entry is None:
-                entry = {
-                    "user_name": f"User {uid}",
-                    "user_displays": [],
-                    "user_ids": [uid],
-                    "author_displays": [],
-                    "author_ids": [],
-                    "candidate_user_ids": [uid],
-                    "guild_ids": [],
-                    "gtts_overrides": {},
-                    "voicevox_speakers": {},
-                    "voicevox_primary_user_id": None,
-                    "voicevox_primary_speaker_id": None,
-                }
-                users.append(entry)
-                user_map[uid] = entry
-            return entry
-
-        for raw_uid, cfg in overrides_state.items():
+    aggregated_speakers: dict[int, int] = {}
+    aggregated_gtts: dict[int, dict[str, float]] = {}
+    for guild in bot.guilds:
+        st = get_state(guild.id)
+        for raw_uid, speaker in (st.get("tts_speakers") or {}).items():
+            try:
+                aggregated_speakers[int(raw_uid)] = int(speaker)
+            except Exception:
+                continue
+        for raw_uid, cfg in (st.get("tts_overrides") or {}).items():
             try:
                 uid = int(raw_uid)
             except Exception:
                 continue
-            entry = _ensure_entry(uid)
-            entry.setdefault("gtts_overrides", {})
-            entry["gtts_overrides"][str(uid)] = {
-                "semitones": float(cfg.get("semitones", 0.0)) if isinstance(cfg, dict) else 0.0,
-                "tempo": float(cfg.get("tempo", 1.0)) if isinstance(cfg, dict) else 1.0,
+            if isinstance(cfg, dict):
+                try:
+                    aggregated_gtts[uid] = {
+                        "semitones": float(cfg.get("semitones", 0.0)),
+                        "tempo": float(cfg.get("tempo", 1.0)),
+                    }
+                except Exception:
+                    aggregated_gtts[uid] = {"semitones": 0.0, "tempo": 1.0}
+
+    users: list[dict[str, T.Any]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+
+    for entry in filtered:
+        user_name = entry.get("user_name")
+        user_displays = list(entry.get("user_displays", []))
+        author_displays = list(entry.get("author_displays", []))
+        user_ids = _to_int_list(entry.get("user_ids"))
+        author_ids = _to_int_list(entry.get("author_ids"))
+        candidate_ids = _to_int_list(entry.get("candidate_user_ids"))
+
+        base_user_display = user_displays[0] if user_displays else (user_name or "")
+        base_author_display = (
+            author_displays[0] if author_displays else base_user_display
+        )
+
+        if not author_ids:
+            # 何らかの ID が取得できなければスキップ
+            continue
+
+        for author_id in author_ids:
+            user_id = user_ids[0] if user_ids else None
+            pair_key = (author_id, user_id)
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            record = {
+                "user_name": user_name,
+                "user_id": str(user_id) if user_id is not None else None,
+                "author_id": str(author_id),
+                "user_display": base_user_display,
+                "author_display": base_author_display,
+                "speaker_id": aggregated_speakers.get(author_id),
+                "gtts_override": aggregated_gtts.get(user_id) if user_id is not None else None,
+                "user_ids": [str(x) for x in user_ids],
+                "author_ids": [str(x) for x in author_ids],
+                "candidate_user_ids": [str(x) for x in candidate_ids],
+                "guild_ids": sorted(set(entry.get("guild_ids", []))),
             }
-            if uid not in entry["candidate_user_ids"]:
-                entry["candidate_user_ids"].append(uid)
-            if uid not in entry["user_ids"]:
-                entry["user_ids"].append(uid)
+            users.append(record)
 
-        for raw_uid, speaker in speakers_state.items():
-            try:
-                uid = int(raw_uid)
-                speaker_id = int(speaker)
-            except Exception:
-                continue
-            entry = _ensure_entry(uid)
-            entry.setdefault("voicevox_speakers", {})
-            entry["voicevox_speakers"][str(uid)] = speaker_id
-            if uid not in entry["candidate_user_ids"]:
-                entry["candidate_user_ids"].append(uid)
-            if uid not in entry["user_ids"]:
-                entry["user_ids"].append(uid)
-            if entry.get("voicevox_primary_speaker_id") is None:
-                entry["voicevox_primary_user_id"] = uid
-                entry["voicevox_primary_speaker_id"] = speaker_id
-
-        for entry in users:
-            entry["candidate_user_ids"] = sorted(set(entry.get("candidate_user_ids", [])))
-            entry["user_ids"] = sorted(set(entry.get("user_ids", [])))
-            # voicevox_primary が未設定の場合でも候補から補完
-            if entry.get("voicevox_primary_speaker_id") is None and entry.get("voicevox_speakers"):
-                for key, val in entry["voicevox_speakers"].items():
-                    try:
-                        entry["voicevox_primary_user_id"] = int(key)
-                        entry["voicevox_primary_speaker_id"] = int(val)
-                        break
-                    except Exception:
-                        continue
+    users.sort(
+        key=lambda item: (
+            str(item.get("user_display") or item.get("user_name") or ""),
+            int(item.get("author_id") or 0),
+        )
+    )
 
     payload = {"ok": True, "users": users, "total": len(users)}
     if keyword:
         payload["query"] = keyword
     return web.json_response(payload, dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
+
+
+def _set_voicevox_speaker_global(author_id: int, speaker_id: int | None) -> None:
+    """VOICEVOX 話者設定を全ギルドへ適用するヘルパー。"""
+
+    for guild in bot.guilds:
+        st = get_state(guild.id)
+        if speaker_id is None:
+            st["tts_speakers"].pop(author_id, None)
+        else:
+            st["tts_speakers"][author_id] = speaker_id
+        _persist_tts_preferences(guild.id, st)
 
 
 async def gui_update_gtts_handler(request: web.Request):
@@ -4426,8 +4423,8 @@ async def gui_update_voicevox_handler(request: web.Request):
         return _gui_error(400, "provider_mismatch", "VOICEVOX を利用していません。")
 
     try:
-        guild_id = int(request.match_info.get("guild_id"))
-        user_id = int(request.match_info.get("user_id"))
+        _ = int(request.match_info.get("guild_id"))
+        path_author_id = int(request.match_info.get("user_id"))
     except (TypeError, ValueError):
         return _gui_error(400, "invalid_path", "guild_id と user_id は整数で指定してください。")
 
@@ -4436,12 +4433,14 @@ async def gui_update_voicevox_handler(request: web.Request):
     except Exception:
         return _gui_error(400, "invalid_json", "JSON ボディを解析できませんでした。")
 
-    state = get_state(guild_id)
-
     if body.get("reset"):
-        state["tts_speakers"].pop(user_id, None)
-        _persist_tts_preferences(guild_id, state)
-        return web.json_response({"ok": True, "speaker_id": None})
+        author_raw = body.get("author_id", path_author_id)
+        try:
+            author_id = int(author_raw)
+        except (TypeError, ValueError):
+            return _gui_error(400, "invalid_value", "`author_id` には整数を指定してください。")
+        _set_voicevox_speaker_global(author_id, None)
+        return web.json_response({"ok": True, "speaker_id": None, "author_id": author_id})
 
     if "speaker_id" not in body:
         return _gui_error(400, "missing_field", "`speaker_id` を指定してください。")
@@ -4450,9 +4449,28 @@ async def gui_update_voicevox_handler(request: web.Request):
     except (TypeError, ValueError):
         return _gui_error(400, "invalid_value", "`speaker_id` には整数を指定してください。")
 
-    state["tts_speakers"][user_id] = speaker_id
-    _persist_tts_preferences(guild_id, state)
-    return web.json_response({"ok": True, "speaker_id": speaker_id})
+    author_raw = body.get("author_id", path_author_id)
+    user_raw = body.get("user_id")
+    try:
+        author_id = int(author_raw)
+    except (TypeError, ValueError):
+        return _gui_error(400, "invalid_value", "`author_id` には整数を指定してください。")
+    try:
+        user_id = int(user_raw)
+    except (TypeError, ValueError):
+        user_id = None
+
+    _set_voicevox_speaker_global(author_id, speaker_id)
+
+    response_payload = {
+        "ok": True,
+        "speaker_id": speaker_id,
+        "author_id": str(author_id),
+        "user_id": str(user_id) if user_id is not None else None,
+        "author_display": body.get("author_display"),
+        "user_display": body.get("user_display"),
+    }
+    return web.json_response(response_payload)
 
 
 async def gui_delete_voicevox_handler(request: web.Request):
@@ -4469,15 +4487,13 @@ async def gui_delete_voicevox_handler(request: web.Request):
         return _gui_error(400, "provider_mismatch", "VOICEVOX を利用していません。")
 
     try:
-        guild_id = int(request.match_info.get("guild_id"))
-        user_id = int(request.match_info.get("user_id"))
+        _ = int(request.match_info.get("guild_id"))
+        author_id = int(request.match_info.get("user_id"))
     except (TypeError, ValueError):
         return _gui_error(400, "invalid_path", "guild_id と user_id は整数で指定してください。")
 
-    state = get_state(guild_id)
-    state["tts_speakers"].pop(user_id, None)
-    _persist_tts_preferences(guild_id, state)
-    return web.json_response({"ok": True, "speaker_id": None})
+    _set_voicevox_speaker_global(author_id, None)
+    return web.json_response({"ok": True, "speaker_id": None, "author_id": str(author_id)})
 
 
 async def _gui_get_voicevox_speakers(force_refresh: bool = False) -> list[dict[str, T.Any]]:
