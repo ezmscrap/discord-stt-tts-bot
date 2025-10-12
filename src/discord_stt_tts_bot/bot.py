@@ -3298,6 +3298,321 @@ def _build_openapi_spec(request: web.Request | None = None) -> dict[str, T.Any]:
                     },
                 },
             }
+            ,
+            "/gui": {
+                "get": {
+                    "tags": ["GUI"],
+                    "summary": "GUI のトップページ",
+                    "description": "読み上げ設定を管理するブラウザ用 GUI のエントリポイントを返します。",
+                    "responses": {
+                        "200": {
+                            "description": "HTML 形式の GUI",
+                            "content": {"text/html": {}},
+                        }
+                    },
+                }
+            },
+            "/api/gui/config": {
+                "get": {
+                    "tags": ["GUI API"],
+                    "summary": "GUI 初期設定の取得",
+                    "description": "利用可能なギルドや現在の TTS プロバイダなど、GUI 表示に必要な初期情報を返します。",
+                    "parameters": [
+                        {
+                            "in": "query",
+                            "name": "guild_id",
+                            "schema": {"type": "integer"},
+                            "description": "対象とするギルド ID。省略時は最初のギルドを使用します。",
+                        }
+                    ],
+                    "security": [{"GUIAdminToken": []}],
+                    "responses": {
+                        "200": {
+                            "description": "設定情報",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/GuiConfigResponse"}
+                                }
+                            },
+                        },
+                        "401": {
+                            "description": "認証失敗",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                                }
+                            },
+                        },
+                    },
+                }
+            },
+            "/api/gui/users": {
+                "get": {
+                    "tags": ["GUI API"],
+                    "summary": "ユーザ設定一覧の取得",
+                    "description": "ログから抽出したユーザリストと gTTS / VOICEVOX 個別設定を返します。",
+                    "parameters": [
+                        {
+                            "in": "query",
+                            "name": "guild_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                            "description": "対象ギルド ID。",
+                        },
+                        {
+                            "in": "query",
+                            "name": "q",
+                            "schema": {"type": "string"},
+                            "description": "部分一致によるユーザ名・ID 検索文字列。",
+                        },
+                        {
+                            "in": "query",
+                            "name": "refresh",
+                            "schema": {"type": "string", "enum": ["0", "1"]},
+                            "description": "\"1\" を指定するとキャッシュを無視します。",
+                        },
+                    ],
+                    "security": [{"GUIAdminToken": []}],
+                    "responses": {
+                        "200": {
+                            "description": "ユーザ一覧",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/GuiUserListResponse"}
+                                }
+                            },
+                        },
+                        "401": {
+                            "description": "認証失敗",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                                }
+                            },
+                        },
+                    },
+                }
+            },
+            "/api/gui/gtts/{guild_id}/{user_id}": {
+                "put": {
+                    "tags": ["GUI API"],
+                    "summary": "gTTS 個別設定の更新",
+                    "description": "指定したユーザ ID に対する gTTS の半音・テンポ設定を更新します。",
+                    "parameters": [
+                        {
+                            "in": "path",
+                            "name": "guild_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                        },
+                        {
+                            "in": "path",
+                            "name": "user_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                        },
+                    ],
+                    "security": [{"GUIAdminToken": []}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/GttsUpdateRequest"}
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "更新成功",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/GttsUpdateResponse"}
+                                }
+                            },
+                        },
+                        "400": {
+                            "description": "リクエストが不正",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                                }
+                            },
+                        },
+                        "401": {
+                            "description": "認証失敗",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                                }
+                            },
+                        },
+                    },
+                },
+                "delete": {
+                    "tags": ["GUI API"],
+                    "summary": "gTTS 個別設定の削除",
+                    "description": "指定したユーザ ID に設定された gTTS 個別設定を削除します。",
+                    "parameters": [
+                        {
+                            "in": "path",
+                            "name": "guild_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                        },
+                        {
+                            "in": "path",
+                            "name": "user_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                        },
+                    ],
+                    "security": [{"GUIAdminToken": []}],
+                    "responses": {
+                        "200": {
+                            "description": "削除成功",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/GttsUpdateResponse"}
+                                }
+                            },
+                        },
+                        "401": {
+                            "description": "認証失敗",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                                }
+                            },
+                        },
+                    },
+                },
+            },
+            "/api/gui/voicevox/{guild_id}/{user_id}": {
+                "put": {
+                    "tags": ["GUI API"],
+                    "summary": "VOICEVOX 個別話者設定の更新",
+                    "description": "指定したユーザ ID に VOICEVOX 話者 ID を割り当てます。",
+                    "parameters": [
+                        {
+                            "in": "path",
+                            "name": "guild_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                        },
+                        {
+                            "in": "path",
+                            "name": "user_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                        },
+                    ],
+                    "security": [{"GUIAdminToken": []}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/VoicevoxUpdateRequest"}
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "更新成功",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/VoicevoxUpdateResponse"}
+                                }
+                            },
+                        },
+                        "401": {
+                            "description": "認証失敗",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                                }
+                            },
+                        },
+                    },
+                },
+                "delete": {
+                    "tags": ["GUI API"],
+                    "summary": "VOICEVOX 個別話者設定の削除",
+                    "description": "指定したユーザ ID に設定された VOICEVOX 話者設定を削除します。",
+                    "parameters": [
+                        {
+                            "in": "path",
+                            "name": "guild_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                        },
+                        {
+                            "in": "path",
+                            "name": "user_id",
+                            "schema": {"type": "integer"},
+                            "required": True,
+                        },
+                    ],
+                    "security": [{"GUIAdminToken": []}],
+                    "responses": {
+                        "200": {
+                            "description": "削除成功",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/VoicevoxUpdateResponse"}
+                                }
+                            },
+                        },
+                        "401": {
+                            "description": "認証失敗",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                                }
+                            },
+                        },
+                    },
+                },
+            },
+            "/api/gui/voicevox/speakers": {
+                "get": {
+                    "tags": ["GUI API"],
+                    "summary": "VOICEVOX 話者一覧の取得",
+                    "description": "VOICEVOX エンジンから取得した話者名、アイコン、サンプル音声の一覧を返します。",
+                    "parameters": [
+                        {
+                            "in": "query",
+                            "name": "q",
+                            "schema": {"type": "string"},
+                            "description": "部分一致検索用の文字列。",
+                        },
+                        {
+                            "in": "query",
+                            "name": "refresh",
+                            "schema": {"type": "string", "enum": ["0", "1"]},
+                            "description": "\"1\" を指定すると VOICEVOX から再取得します。",
+                        },
+                    ],
+                    "security": [{"GUIAdminToken": []}],
+                    "responses": {
+                        "200": {
+                            "description": "話者一覧",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/VoicevoxSpeakerListResponse"}
+                                }
+                            },
+                        },
+                        "401": {
+                            "description": "認証失敗",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                                }
+                            },
+                        },
+                    },
+                }
+            },
         },
         "components": {
             "securitySchemes": {
@@ -3306,7 +3621,13 @@ def _build_openapi_spec(request: web.Request | None = None) -> dict[str, T.Any]:
                     "in": "header",
                     "name": "X-CCF-Token",
                     "description": "CCFOLIA_POST_SECRET の値と一致するトークン。未設定時は不要です。",
-                }
+                },
+                "GUIAdminToken": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-Admin-Token",
+                    "description": "GUI_ADMIN_TOKEN の値。GUI を保護するための簡易トークンです。",
+                },
             },
             "schemas": {
                 "CCFoliaEventRequest": {
@@ -3351,6 +3672,149 @@ def _build_openapi_spec(request: web.Request | None = None) -> dict[str, T.Any]:
                         },
                     },
                     "required": ["ok", "error"],
+                },
+                "GuiConfigResponse": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "ok": {"type": "boolean", "example": True},
+                        "provider": {"type": "string", "example": "voicevox"},
+                        "guild_id": {"type": "integer", "example": 1234567890},
+                        "requires_token": {"type": "boolean"},
+                        "base_tempo": {"type": "number", "format": "float", "example": 0.7},
+                        "default_voicevox_speaker": {"type": "integer", "example": 2},
+                        "available_guilds": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "guild_id": {"type": "integer"},
+                                    "name": {"type": "string"},
+                                },
+                                "required": ["guild_id", "name"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["ok", "provider", "guild_id", "requires_token", "available_guilds"],
+                },
+                "GuiUserListResponse": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean", "example": True},
+                        "total": {"type": "integer", "example": 12},
+                        "query": {"type": "string"},
+                        "users": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/GuiUserEntry"},
+                        },
+                    },
+                    "required": ["ok", "total", "users"],
+                },
+                "GuiUserEntry": {
+                    "type": "object",
+                    "properties": {
+                        "user_name": {"type": "string"},
+                        "user_displays": {"type": "array", "items": {"type": "string"}},
+                        "author_displays": {"type": "array", "items": {"type": "string"}},
+                        "user_ids": {"type": "array", "items": {"type": "integer"}},
+                        "author_ids": {"type": "array", "items": {"type": "integer"}},
+                        "candidate_user_ids": {"type": "array", "items": {"type": "integer"}},
+                        "guild_ids": {"type": "array", "items": {"type": "integer"}},
+                        "gtts_overrides": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "object",
+                                "properties": {
+                                    "semitones": {"type": "number", "format": "float"},
+                                    "tempo": {"type": "number", "format": "float"},
+                                },
+                                "required": ["semitones", "tempo"],
+                            },
+                        },
+                        "voicevox_speakers": {
+                            "type": "object",
+                            "additionalProperties": {"type": "integer"},
+                        },
+                    },
+                    "required": ["user_name", "candidate_user_ids"],
+                    "additionalProperties": False,
+                },
+                "VoicevoxSpeakerListResponse": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean", "example": True},
+                        "total": {"type": "integer"},
+                        "query": {"type": "string"},
+                        "speakers": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/VoicevoxSpeakerEntry"},
+                        },
+                    },
+                    "required": ["ok", "total", "speakers"],
+                },
+                "VoicevoxSpeakerEntry": {
+                    "type": "object",
+                    "properties": {
+                        "speaker_name": {"type": "string"},
+                        "speaker_id": {"type": "integer"},
+                        "speaker_uuid": {"type": "string"},
+                        "style_name": {"type": "string"},
+                        "icon": {"type": "string", "description": "data URL 形式のアイコン画像"},
+                        "voice_samples": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": {"type": "integer"},
+                                    "url": {"type": "string", "description": "data URL 形式の音声サンプル"},
+                                },
+                                "required": ["index", "url"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["speaker_name", "speaker_id", "speaker_uuid"],
+                    "additionalProperties": False,
+                },
+                "GttsUpdateRequest": {
+                    "type": "object",
+                    "properties": {
+                        "semitones": {"type": "number", "format": "float"},
+                        "tempo": {"type": "number", "format": "float"},
+                        "reset": {"type": "boolean", "description": "True を指定するとリセットを実施します。"},
+                    },
+                    "additionalProperties": False,
+                },
+                "GttsUpdateResponse": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean", "example": True},
+                        "override": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "semitones": {"type": "number"},
+                                "tempo": {"type": "number"},
+                            },
+                        },
+                    },
+                    "required": ["ok"],
+                },
+                "VoicevoxUpdateRequest": {
+                    "type": "object",
+                    "properties": {
+                        "speaker_id": {"type": "integer"},
+                        "reset": {"type": "boolean"},
+                    },
+                    "additionalProperties": False,
+                },
+                "VoicevoxUpdateResponse": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean", "example": True},
+                        "speaker_id": {"type": ["integer", "null"]},
+                    },
+                    "required": ["ok"],
                 },
             },
         },
