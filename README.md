@@ -9,6 +9,7 @@ Discord のボイスチャンネルで **テキスト読み上げ (TTS)** と **
 - 音声認識結果をユーザーごとに色分けしてEmbed表示（16色パレット／個別指定可）
 - Stage チャンネル対応、字幕用スレッドの自動運用
 - 読み上げ速度や声色プロファイルのカスタマイズ
+- `!ttsvoice` や `!ttsspeaker` で指定した話者情報をディスクへ保存し、再起動後も自動復元
 
 ## リポジトリ構成
 ```
@@ -57,6 +58,7 @@ VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:5
 - `TTS_PROVIDER=voicevox` … `.env` の `VOICEVOX_BASE_URL` で指定した VOICEVOX エンジンを利用します。ユーザーごとの話者IDは `!ttsspeaker` コマンドでエクスポート／インポート・個別設定が可能です。
 - VOICEVOX のスタイル一覧は `!voicevoxstyles` で確認でき、字幕カラーのパレットは `!sttpalette` で参照できます。
 - VOICEVOX のユーザー辞書は `!voxdict export/import/add` で管理できます。
+- 話者情報指定機能（`!ttsvoice` / `!ttsspeaker` など）で登録した内容は `data/tts_profiles.json` に保存され、ボットを再起動しても維持されます。保存先は `BOT_STATE_DIR` 環境変数で変更できます。
 
 ## コマンドの詳細
 

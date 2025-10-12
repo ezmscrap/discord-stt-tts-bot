@@ -1,4 +1,4 @@
-import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time,csv, json
+import io, os, wave, asyncio, tempfile, traceback, struct, math,re, time,csv, json, threading
 import audioop
 import collections
 import shutil
@@ -118,6 +118,15 @@ def _resolve_log_dir(base_dir: Path, env_value: str | None) -> Path:
         p = base_dir / p
     return p
 
+def _resolve_data_dir(base_dir: Path, env_value: str | None, default_name: str) -> Path:
+    if not env_value or not env_value.strip():
+        return base_dir / default_name
+    expanded = os.path.expanduser(os.path.expandvars(env_value.strip()))
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path
+
 LOG_DIR = _resolve_log_dir(PROJECT_ROOT, os.getenv("LOG_DIR"))
 TTS_LOG_PATH = LOG_DIR / "tts_logs.csv"
 STT_LOG_PATH = LOG_DIR / "stt_logs.csv"
@@ -125,6 +134,134 @@ STT_METRICS_PATH = LOG_DIR / "stt_metrics.csv"
 CCFO_LOG_PATH = LOG_DIR / "ccfolia_event_logs.csv"
 _log_lock = asyncio.Lock()  # 複数タスクからの同時書き込みを保護
 print(f"[LOG] output directory: {LOG_DIR}")  # 起動時に出力先を表示
+DATA_DIR = _resolve_data_dir(PROJECT_ROOT, os.getenv("BOT_STATE_DIR"), "data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TTS_PERSIST_PATH = DATA_DIR / "tts_profiles.json"
+_tts_persist_lock = threading.Lock()
+_tts_persist_cache: dict[int, dict] = {}
+
+
+def _load_tts_persist_cache():
+    global _tts_persist_cache
+    if not TTS_PERSIST_PATH.exists():
+        _tts_persist_cache = {}
+        return
+    try:
+        with open(TTS_PERSIST_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as exc:
+        print(f"[TTS] failed to load persisted speaker settings: {exc!r}")
+        _tts_persist_cache = {}
+        return
+    if isinstance(raw, dict) and "guilds" in raw and isinstance(raw["guilds"], dict):
+        raw = raw["guilds"]
+    new_cache: dict[int, dict] = {}
+    if isinstance(raw, dict):
+        for gid, payload in raw.items():
+            try:
+                gid_int = int(gid)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                new_cache[gid_int] = payload
+    _tts_persist_cache = new_cache
+
+
+def _hydrate_tts_state_from_disk(state: dict, guild_id: int):
+    with _tts_persist_lock:
+        payload = _tts_persist_cache.get(guild_id)
+    if not payload:
+        return
+    try:
+        state["tts_base_tempo"] = float(payload.get("tts_base_tempo", state.get("tts_base_tempo", 0.7)))
+    except Exception:
+        pass
+    try:
+        state["tts_default_speaker"] = int(payload.get("tts_default_speaker", state.get("tts_default_speaker", VOICEVOX_DEFAULT_SPEAKER)))
+    except Exception:
+        pass
+    overrides_raw = payload.get("tts_overrides", {})
+    overrides: dict[int, dict[str, float]] = {}
+    if isinstance(overrides_raw, dict):
+        for uid, cfg in overrides_raw.items():
+            try:
+                uid_int = int(uid)
+            except Exception:
+                continue
+            if not isinstance(cfg, dict):
+                continue
+            try:
+                semi = float(cfg.get("semitones", 0.0))
+            except Exception:
+                semi = 0.0
+            try:
+                tempo = float(cfg.get("tempo", 1.0))
+            except Exception:
+                tempo = 1.0
+            overrides[uid_int] = {"semitones": semi, "tempo": tempo}
+    state["tts_overrides"] = overrides
+
+    speakers_raw = payload.get("tts_speakers", {})
+    speakers: dict[int, int] = {}
+    if isinstance(speakers_raw, dict):
+        for uid, sid in speakers_raw.items():
+            try:
+                speakers[int(uid)] = int(sid)
+            except Exception:
+                continue
+    state["tts_speakers"] = speakers
+
+
+def _persist_tts_preferences(guild_id: int, state: dict):
+    payload = {
+        "tts_base_tempo": float(state.get("tts_base_tempo", 0.7)),
+        "tts_default_speaker": int(state.get("tts_default_speaker", VOICEVOX_DEFAULT_SPEAKER)),
+        "tts_speakers": {},
+        "tts_overrides": {},
+    }
+    for uid, sid in (state.get("tts_speakers") or {}).items():
+        try:
+            payload["tts_speakers"][str(int(uid))] = int(sid)
+        except Exception:
+            continue
+    for uid, cfg in (state.get("tts_overrides") or {}).items():
+        if not isinstance(cfg, dict):
+            continue
+        try:
+            uid_key = str(int(uid))
+        except Exception:
+            continue
+        try:
+            semi = float(cfg.get("semitones", 0.0))
+        except Exception:
+            semi = 0.0
+        try:
+            tempo = float(cfg.get("tempo", 1.0))
+        except Exception:
+            tempo = 1.0
+        payload["tts_overrides"][uid_key] = {"semitones": semi, "tempo": tempo}
+
+    serializable = {}
+    try:
+        with _tts_persist_lock:
+            serializable = {
+                "guilds": {
+                    str(gid): data
+                    for gid, data in {**_tts_persist_cache, guild_id: payload}.items()
+                }
+            }
+            _tts_persist_cache[guild_id] = payload
+        tmp_path = TTS_PERSIST_PATH.with_suffix(".tmp")
+        TTS_PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, TTS_PERSIST_PATH)
+    except Exception as exc:
+        print(f"[TTS] failed to persist speaker settings for guild {guild_id}: {exc!r}")
+
+
+_load_tts_persist_cache()
+
 
 def _ensure_csv_with_header(path: Path, headers: list[str]):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1199,6 +1336,7 @@ def get_state(guild_id):
             pcm_buffers={},
             pcm_last_seen={},
         )
+        _hydrate_tts_state_from_disk(guild_state[guild_id], guild_id)
     return guild_state[guild_id]
 
 
@@ -1773,6 +1911,7 @@ async def ttsspeed(ctx: commands.Context, ratio: str = None):
 
     st = get_state(ctx.guild.id)
     st["tts_base_tempo"] = r
+    _persist_tts_preferences(ctx.guild.id, st)
     await ctx.reply(f"✅ サーバー基準の読み上げ話速を **{r:.2f}倍** に設定しました。")
 
 @bot.command(name="ttsvoice", aliases=["声色"])
@@ -1794,6 +1933,7 @@ async def ttsvoice(ctx: commands.Context, member: discord.Member = None, semiton
 
     if semitones.lower() == "reset":
         st["tts_overrides"].pop(member.id, None)
+        _persist_tts_preferences(ctx.guild.id, st)
         return await ctx.reply(f"🔄 {member.display_name} の個別声設定をリセットしました。")
 
     # "+3" や "-5" などに対応
@@ -1814,6 +1954,7 @@ async def ttsvoice(ctx: commands.Context, member: discord.Member = None, semiton
         return await ctx.reply("テンポは数値で指定してください（例: 1.10）。")
 
     st["tts_overrides"][member.id] = {"semitones": semi, "tempo": t}
+    _persist_tts_preferences(ctx.guild.id, st)
     await ctx.reply(
         f"✅ {member.display_name} の声色を設定しました： 半音 **{semi:+.1f}**, テンポ係数 **{t:.2f}**"
     )
@@ -1902,6 +2043,7 @@ async def ttsspeaker(ctx: commands.Context, *args):
             return await ctx.reply("user_speakers 内のキーと値は整数で指定してください。")
 
         st["tts_speakers"] = new_map
+        _persist_tts_preferences(ctx.guild.id, st)
         return await ctx.reply(f"VOICEVOX 話者設定を {len(new_map)} 件読み込みました。")
 
     if keyword == "default":
@@ -1914,6 +2056,7 @@ async def ttsspeaker(ctx: commands.Context, *args):
         except Exception:
             return await ctx.reply("speaker_id は整数で指定してください。")
         st["tts_default_speaker"] = sid
+        _persist_tts_preferences(ctx.guild.id, st)
         return await ctx.reply(f"VOICEVOX デフォルト話者IDを {sid} に設定しました。")
 
     # 個別ユーザー設定
@@ -1940,6 +2083,7 @@ async def ttsspeaker(ctx: commands.Context, *args):
     value = args[1].lower()
     if value in ("reset", "clear"):
         st["tts_speakers"].pop(member.id, None)
+        _persist_tts_preferences(ctx.guild.id, st)
         return await ctx.reply(f"{member.display_name} の VOICEVOX 話者設定を削除しました。")
 
     try:
@@ -1948,6 +2092,7 @@ async def ttsspeaker(ctx: commands.Context, *args):
         return await ctx.reply("speaker_id は整数で指定してください。")
 
     st["tts_speakers"][member.id] = sid
+    _persist_tts_preferences(ctx.guild.id, st)
     if member == ctx.author:
         return await ctx.reply(f"あなたの VOICEVOX 話者IDを {sid} に設定しました。")
     return await ctx.reply(f"{member.display_name} の VOICEVOX 話者IDを {sid} に設定しました。")

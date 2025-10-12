@@ -36,6 +36,7 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
    VOICEVOX_DEFAULT_SPEAKER=2
    VOICEVOX_TIMEOUT=15
    LOG_DIR=logs
+   BOT_STATE_DIR=data          # 話者情報などを保存するディレクトリ（省略時は ./data）
    ```
 
 2. 仮想環境を作成して依存パッケージをインストールします。
@@ -139,6 +140,11 @@ Discord Voice Caption & TTS Bot の詳細なセットアップ手順と運用方
 - `!voxdict <export|import|add>` … VOICEVOX のユーザー辞書を管理します。例: `!voxdict add テスト テスト`
 
 > VOICEVOX を利用する場合は `.env` の `TTS_PROVIDER=voicevox` と `VOICEVOX_BASE_URL` を設定してください。
+
+#### 話者情報指定機能の永続化
+- `!ttsvoice` や `!ttsspeaker` で設定した読み上げ話者情報はギルドごとに `data/tts_profiles.json` へ自動保存され、ボットを再起動しても復元されます。
+- 保存先ディレクトリは `BOT_STATE_DIR` 環境変数で変更できます（未指定時はリポジトリ直下の `data/`）。
+- 設定を個別に初期化したい場合は各コマンドの `reset`/`clear` サブコマンドを利用してください。ファイルを削除すると全ギルド分のキャッシュが消去されます。
 
 ### デバッグ／ユーティリティ
 - `!stttest` … gTTS→Whisper の疎通テストを実行します。例: `!stttest`
