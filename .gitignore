@@ -31,6 +31,9 @@ __pypackages__/
 .idea/
 .DS_Store
 
+# Setting
+data/
+
 # Logs & audio artifacts
 logs/
 *.log
