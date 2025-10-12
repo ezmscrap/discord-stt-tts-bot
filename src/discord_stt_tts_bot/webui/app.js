@@ -817,12 +817,18 @@ function createVoicevoxControl(user, candidateIds) {
   userLabel.textContent = "対象ユーザ ID";
   const userSelect = document.createElement("select");
   userSelect.name = "user-id";
+  const voicevoxOverrides = user.voicevox_speakers || {};
+  const initialUserId =
+    candidateIds
+      .map((id) => String(id))
+      .find((id) => voicevoxOverrides[id] !== undefined) ?? String(candidateIds[0]);
   for (const id of candidateIds) {
     const option = document.createElement("option");
     option.value = String(id);
     option.textContent = String(id);
     userSelect.appendChild(option);
   }
+  userSelect.value = initialUserId;
   userLabel.appendChild(userSelect);
 
   const speakerLabel = document.createElement("label");
