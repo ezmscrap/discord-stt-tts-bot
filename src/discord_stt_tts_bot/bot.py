@@ -4,6 +4,7 @@ import collections
 import shutil
 import discord
 import typing as T
+from types import MethodType
 
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
@@ -84,6 +85,12 @@ _ccfo_event_last_seen_map: dict[tuple[str, str, str, str], datetime] = {}
 _ccfo_event_history_loaded: bool = False
 # イベント履歴を読み書きする際の同期用ロック
 _ccfo_event_history_lock = asyncio.Lock()
+# CCFOLIA Webサーバーのランナー参照（クリーンアップ用）
+_ccfo_web_runner: web.AppRunner | None = None
+# CCFOLIA Webサーバーのサイト参照（クリーンアップ用）
+_ccfo_web_site: web.TCPSite | None = None
+# バックグラウンドタスク集合（キャンセル管理用）
+_ccfo_background_tasks: set[asyncio.Task[object]] = set()
 # === CCFOLIA BRIDGE END: env ===
 
 # === GUI 簡易設定 ===
@@ -637,6 +644,17 @@ bot = commands.Bot(command_prefix=("!", "！"), intents=intents, help_command=No
 openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 guild_state = {}  # guild_id -> dict( read_channel_id, stt_on, record_window )
+
+_original_bot_close = bot.close
+
+async def _close_with_cleanup(self: commands.Bot) -> None:
+    """Bot 終了時に追加のクリーンアップ処理を挟む。"""
+    await _cancel_background_tasks()
+    await _stop_ccfo_web_server()
+    await _disconnect_all_voice_clients(self)
+    await _original_bot_close()
+
+bot.close = MethodType(_close_with_cleanup, bot)
 
 DEFAULT_WINDOW = 10  # 秒ごとに録音を区切って字幕化
 
@@ -4876,6 +4894,10 @@ async def ccfo_post_handler(request: web.Request):
 
 
 async def _start_ccfo_web_server():
+    """CCFOLIA 向け Web サーバーを起動する。"""
+    global _ccfo_web_runner, _ccfo_web_site
+    if _ccfo_web_runner is not None:
+        return
     app = web.Application()
     app.add_routes([
         web.post("/ccfolia_event", ccfo_post_handler),
@@ -4898,6 +4920,8 @@ async def _start_ccfo_web_server():
     await runner.setup()
     site = web.TCPSite(runner, host=CCFO_HOST, port=CCFO_PORT)
     await site.start()
+    _ccfo_web_runner = runner
+    _ccfo_web_site = site
     print(f"[CCFOLIA] bridge server started at http://{CCFO_HOST}:{CCFO_PORT}")
 
 def _resolve_ccfo_speaker_id(name: str) -> int:
@@ -4920,6 +4944,60 @@ async def _ccfo_send_voicevox_file(ch: discord.TextChannel, speaker: str, text: 
         return
     bio = io.BytesIO(wav); bio.seek(0)
     await ch.send(file=discord.File(bio, filename=f"{speaker}.wav"))
+
+def _register_background_task(task: asyncio.Task[object]) -> None:
+    """バックグラウンドタスクを登録して後段のキャンセルに備える。
+
+    Args:
+        task: 追跡対象のタスク。
+    """
+    _ccfo_background_tasks.add(task)
+    task.add_done_callback(lambda finished: _ccfo_background_tasks.discard(finished))  # type: ignore[arg-type]
+
+
+async def _cancel_background_tasks() -> None:
+    """起動中のバックグラウンドタスクをすべてキャンセルする。"""
+    if not _ccfo_background_tasks:
+        return
+    for background_task in list(_ccfo_background_tasks):
+        background_task.cancel()
+    await asyncio.gather(*_ccfo_background_tasks, return_exceptions=True)
+    _ccfo_background_tasks.clear()
+
+
+async def _stop_ccfo_web_server() -> None:
+    """CCFOLIA ブリッジ用 Web サーバーを停止する。"""
+    global _ccfo_web_site, _ccfo_web_runner
+    if _ccfo_web_site is not None:
+        await _ccfo_web_site.stop()
+        _ccfo_web_site = None
+    if _ccfo_web_runner is not None:
+        await _ccfo_web_runner.cleanup()
+        _ccfo_web_runner = None
+
+
+async def _disconnect_all_voice_clients(bot_instance: commands.Bot) -> None:
+    """ボットが接続中の全ボイスチャンネルから切断する。
+
+    Args:
+        bot_instance: 対象の Bot インスタンス。
+    """
+    voice_clients = list(bot_instance.voice_clients)
+    if not voice_clients:
+        return
+    disconnect_coroutines: list[asyncio.Task[object]] = []
+    for voice_client in voice_clients:
+        try:
+            await ensure_stopped(voice_client, "shutdown")
+        except Exception:
+            traceback.print_exc()
+        try:
+            disconnect_coroutines.append(asyncio.create_task(voice_client.disconnect(force=True)))
+        except Exception:
+            traceback.print_exc()
+    if disconnect_coroutines:
+        await asyncio.gather(*disconnect_coroutines, return_exceptions=True)
+
 
 async def _ccfo_play_in_vc(guild: discord.Guild, text: str, spk_id: int):
     vc = guild.voice_client
@@ -4947,48 +5025,52 @@ async def ccfo_pump_worker():
     print(['CCFO_MIRROR_CH_ID:',CCFO_MIRROR_CH_ID]) # for debug
     text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
 
-    while True:
-        event_payload = await ccfo_queue.get()
-        print('check:ccfo_queue') # for debug
-        print(ccfo_queue) # for debug
-        speaker_name = event_payload.get("speaker") or "（未指定）"
-        text_for_dispatch = event_payload.get("text") or ""
-        room_name = event_payload.get("room") or ""
-        client_event_tag = event_payload.get("ts_client") or ""
-        resolved_speaker_id = _resolve_ccfo_speaker_id(speaker_name)
-        
-        if not text_ch:
-            text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
+    try:
+        while True:
+            event_payload = await ccfo_queue.get()
+            print('check:ccfo_queue') # for debug
+            print(ccfo_queue) # for debug
+            speaker_name = event_payload.get("speaker") or "（未指定）"
+            text_for_dispatch = event_payload.get("text") or ""
+            room_name = event_payload.get("room") or ""
+            client_event_tag = event_payload.get("ts_client") or ""
+            resolved_speaker_id = _resolve_ccfo_speaker_id(speaker_name)
 
-        print(['speaker',speaker_name]) # for debug
-        print(['text',text_for_dispatch]) # for debug
-        print(['room',room_name]) # for debug
-        print(['ts_client',client_event_tag]) # for debug
-        print(['spk_id',resolved_speaker_id]) # for debug
-        print(['text_ch',text_ch]) # for debug
+            if not text_ch:
+                text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
 
-        # 1) テキストミラー
-        if isinstance(text_ch, discord.TextChannel):
-            print(['ccfolia event send to discord :text:',speaker_name,',',text_for_dispatch]) # for debug
-            await _ccfo_send_text(text_ch, speaker_name, text_for_dispatch, room_name, client_event_tag)
+            print(['speaker',speaker_name]) # for debug
+            print(['text',text_for_dispatch]) # for debug
+            print(['room',room_name]) # for debug
+            print(['ts_client',client_event_tag]) # for debug
+            print(['spk_id',resolved_speaker_id]) # for debug
+            print(['text_ch',text_ch]) # for debug
 
-        # 2) TTS
-        if CCFO_TTS_MODE == "file":
+            # 1) テキストミラー
             if isinstance(text_ch, discord.TextChannel):
-                await _ccfo_send_voicevox_file(text_ch, speaker_name, text_for_dispatch, resolved_speaker_id)
-        elif CCFO_TTS_MODE == "voice":
-            ## 未指定は読み上げない。
-            #if sp == "（未指定）":
-            #    break
-            # 最初のギルドに対して VC 再生を試みる（必要なら env で GUILD 固定も可）
-            guilds = bot.guilds
-            ok = False
-            for g in guilds:
-                ok = await _ccfo_play_in_vc(g, f"{speaker_name}：{text_for_dispatch}", resolved_speaker_id)
-                if ok:
-                    break
-            if not ok and isinstance(text_ch, discord.TextChannel):
-                await text_ch.send("（VC未接続のためTTSは再生できませんでした）")
+                print(['ccfolia event send to discord :text:',speaker_name,',',text_for_dispatch]) # for debug
+                await _ccfo_send_text(text_ch, speaker_name, text_for_dispatch, room_name, client_event_tag)
+
+            # 2) TTS
+            if CCFO_TTS_MODE == "file":
+                if isinstance(text_ch, discord.TextChannel):
+                    await _ccfo_send_voicevox_file(text_ch, speaker_name, text_for_dispatch, resolved_speaker_id)
+            elif CCFO_TTS_MODE == "voice":
+                ## 未指定は読み上げない。
+                #if sp == "（未指定）":
+                #    break
+                # 最初のギルドに対して VC 再生を試みる（必要なら env で GUILD 固定も可）
+                guilds = bot.guilds
+                ok = False
+                for g in guilds:
+                    ok = await _ccfo_play_in_vc(g, f"{speaker_name}：{text_for_dispatch}", resolved_speaker_id)
+                    if ok:
+                        break
+                if not ok and isinstance(text_ch, discord.TextChannel):
+                    await text_ch.send("（VC未接続のためTTSは再生できませんでした）")
+    except asyncio.CancelledError:
+        print("[CCFOLIA] pump worker cancelled")
+        raise
 
 # 起動時に webサーバ と ポンプを起動
 _original_on_ready = bot.on_ready
@@ -5005,8 +5087,10 @@ async def on_ready():
     # 一度だけ起動
     if not getattr(bot, "_ccfo_server_started", False):
         bot._ccfo_server_started = True
-        bot.loop.create_task(_start_ccfo_web_server())
-        bot.loop.create_task(ccfo_pump_worker())
+        server_task = bot.loop.create_task(_start_ccfo_web_server(), name="ccfo_web_server")
+        _register_background_task(server_task)
+        pump_task = bot.loop.create_task(ccfo_pump_worker(), name="ccfo_pump_worker")
+        _register_background_task(pump_task)
         print("[CCFOLIA] pump & server tasks started")
 # === CCFOLIA BRIDGE END ===
 
