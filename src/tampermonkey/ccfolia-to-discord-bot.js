@@ -45,12 +45,10 @@ function markExistingAsSeen(root) {
 
 /* --- HTTP POST (detailed logging) --- */
 function postOne(payload) {
-    console.log('start:postOne')//デバッグ用
   const url = ENDPOINT;
   const body = JSON.stringify(payload || {});
   const headers = { 'Content-Type': 'application/json', 'X-CCF-Token': SECRET };
 
-      console.log(payload)//デバッグ用
   // Tampermonkey v4/v5 互換 (どちらか片方しか無い環境に対応)
   const req = (typeof GM_xmlhttpRequest === 'function')
                 ? GM_xmlhttpRequest
@@ -63,7 +61,6 @@ function postOne(payload) {
     return;
   }
 
-  console.log('[CCFO] POST →', url, payload);
 
   try {
     req({
@@ -107,7 +104,6 @@ function postOne(payload) {
   } catch (e) {
     warn('POST exception', e);
   }
-    console.log('end:postOne')//デバッグ用
 }
 
   /* --- 行パース（簡易・堅牢） --- */
@@ -192,12 +188,10 @@ function parseLine(div){
           'div[class*="MuiListItemText-root"][class*="MuiListItemText-multiline"]:not([data-ccfo-sent])',
           base
       );
-      console.log(lines)//デバッグ用
       for (const p of lines) {
         try {
           const parsed = parseLine(p);
           if (!parsed) continue;
-          console.log(parsed)//デバッグ用
           postOne({ ...parsed, room: roomName, ts_client: fmtISO(new Date()) });
           try { p.setAttribute('data-ccfo-sent', '1'); } catch {}
         } catch {}
