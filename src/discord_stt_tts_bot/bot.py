@@ -6,6 +6,7 @@ import discord
 import typing as T
 
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from dotenv import load_dotenv
 from discord import StageChannel, TextChannel, Thread
 from discord.abc import Messageable
@@ -71,6 +72,16 @@ CCFO_SPK_MAP = json.loads(os.getenv("CCFOLIA_SPEAKER_MAP_JSON", '{"（未指定�
 CCFO_DEFAULT_SPK = int(os.getenv("CCFOLIA_DEFAULT_SPEAKER", "2"))
 # イベントキュー
 ccfo_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+# ココフォリアの重複対策用に、直近のイベント履歴を保持する件数
+CCFO_EVENT_HISTORY_LIMIT: int = 300
+# ココフォリア連携の重複判定に用いるイベント履歴
+_ccfo_event_history: collections.deque["CCFoliaEventRecord"] = collections.deque()
+# 履歴に高速にアクセスするための集合
+_ccfo_event_history_index: set["CCFoliaEventRecord"] = set()
+# ログから履歴を読み込む処理が完了したかどうかのフラグ
+_ccfo_event_history_loaded: bool = False
+# イベント履歴を読み書きする際の同期用ロック
+_ccfo_event_history_lock = asyncio.Lock()
 # === CCFOLIA BRIDGE END: env ===
 
 # === GUI 簡易設定 ===
@@ -313,7 +324,7 @@ _ensure_csv_with_header(
 )
 _ensure_csv_with_header(
     CCFO_LOG_PATH,
-    ["timestamp_iso", "user_display", "text"],
+    ["timestamp_iso", "user_display", "text", "room", "ts_client"],
 )
 
 def _norm_text_for_csv(text: str) -> str:
@@ -458,19 +469,118 @@ def _evaluate_transcription_response(resp, text: str, duration: float | None) ->
 
     return metrics, should_retry
 
+@dataclass(frozen=True)
+class CCFoliaEventRecord:
+    """ココフォリア連携の重複判定に利用するイベント情報.
+
+    Attributes:
+        speaker: 発言者名（正規化済み）。
+        text: 発言本文（CSV向けに正規化済み）。
+        room: ココフォリアの部屋名。
+        ts_client: クライアントが送信したタイムスタンプや識別子。
+    """
+
+    speaker: str
+    text: str
+    room: str
+    ts_client: str
+
+
+def _append_ccfo_event_history(entry: CCFoliaEventRecord) -> None:
+    """重複判定用の履歴へイベントを追加する.
+
+    Args:
+        entry: 追加対象のイベント。
+    """
+    _ccfo_event_history.append(entry)
+    _ccfo_event_history_index.add(entry)
+    while len(_ccfo_event_history) > CCFO_EVENT_HISTORY_LIMIT:
+        removed_entry = _ccfo_event_history.popleft()  # 上限超過で除外した最古のイベント
+        _ccfo_event_history_index.discard(removed_entry)
+
+
+def _ccfo_row_to_event_record(row: list[str]) -> CCFoliaEventRecord | None:
+    """CSVの1行からイベント情報を復元する.
+
+    Args:
+        row: CSVの行データ。
+
+    Returns:
+        復元したイベント。復元できない場合はNone。
+    """
+    if len(row) < 3:
+        return None
+    speaker = (row[1] if len(row) > 1 else "").strip()
+    text = _norm_text_for_csv(row[2] if len(row) > 2 else "")
+    room = (row[3] if len(row) > 3 else "").strip()
+    ts_client = (row[4] if len(row) > 4 else "").strip()
+    return CCFoliaEventRecord(
+        speaker=speaker,
+        text=text,
+        room=room,
+        ts_client=ts_client,
+    )
+
+
+async def _load_ccfo_event_history_from_log() -> None:
+    """ログファイルから重複判定用の履歴を読み込む.
+
+    Returns:
+        None.
+    """
+    global _ccfo_event_history_loaded
+    if _ccfo_event_history_loaded:
+        return
+    async with _ccfo_event_history_lock:
+        if _ccfo_event_history_loaded:
+            return
+        if not CCFO_LOG_PATH.exists():
+            _ccfo_event_history_loaded = True
+            return
+        try:
+            async with _log_lock:
+                with open(CCFO_LOG_PATH, newline="", encoding="utf-8") as log_file:
+                    reader = csv.reader(log_file)
+                    next(reader, None)
+                    for row in reader:
+                        entry = _ccfo_row_to_event_record(row)
+                        if entry is not None:
+                            _append_ccfo_event_history(entry)
+        except Exception as exc:
+            print(f"[CCFOLIA] failed to load ccfo history: {exc!r}")
+        finally:
+            _ccfo_event_history_loaded = True
+
+
 async def log_ccfolia_event(
-    user_display: str,
-    text: str,
-):
-    print(['log:',CCFO_LOG_PATH,',',user_display,',',text])
-    """ココフォリア連携のログ（発言者・発言時間（記録時刻）付き）"""
-    ts = datetime.now(timezone.utc).isoformat()
-    row = [
-        ts,
-        user_display,
-        _norm_text_for_csv(text),
-    ]
+    event: CCFoliaEventRecord,
+) -> bool:
+    """ココフォリアのイベントをログへ記録し、重複を抑止する.
+
+    Args:
+        event: 記録したいイベント。
+
+    Returns:
+        Trueなら新規イベントを記録したことを示し、Falseなら既存のイベントだったことを示す。
+    """
+    await _load_ccfo_event_history_from_log()
+    row: list[str]
+    async with _ccfo_event_history_lock:
+        if event in _ccfo_event_history_index:
+            print(f"[CCFOLIA] duplicated event skipped: {event.speaker} / {event.text}")
+            return False
+        _append_ccfo_event_history(event)
+        ts_iso = datetime.now(timezone.utc).isoformat()  # ログ用のUTCタイムスタンプ
+        row = [
+            ts_iso,
+            event.speaker,
+            event.text,
+            event.room,
+            event.ts_client,
+        ]
     await _append_csv(CCFO_LOG_PATH, row)
+    print(["log:", CCFO_LOG_PATH, ",", event.speaker, ",", event.text])
+    return True
 
 if OPENAI_API_KEY:
     print(f"[STT] OPENAI_API_KEY detected.")
@@ -4699,13 +4809,23 @@ async def ccfo_post_handler(request: web.Request):
     txt = (data.get("text") or "").strip()
     room = (data.get("room") or "").strip()
     ts_client = (data.get("ts_client") or "").strip()
+    normalized_text = _norm_text_for_csv(txt)  # Discord連携用に正規化したテキスト
     print(['speaker',spk]) # for debug
     print(['text',txt]) # for debug
     print(['room',room]) # for debug
     print(['ts_client',ts_client]) # for debug
-    await log_ccfolia_event(user_display=spk,text=txt)
-    if not txt:
+    if not normalized_text:
         return web.json_response({"ok": False, "error": "empty_text"}, status=400, headers=_cors_headers(origin))
+
+    event_record = CCFoliaEventRecord(
+        speaker=spk,
+        text=normalized_text,
+        room=room,
+        ts_client=ts_client,
+    )
+    is_new_event = await log_ccfolia_event(event=event_record)  # 重複を避けつつログへ記録
+    if not is_new_event:
+        return web.json_response({"ok": True}, headers=_cors_headers(origin))
 
     await ccfo_queue.put({"speaker": spk, "text": txt, "room": room, "ts_client": ts_client})
     print('check:ccfo_queue') # for debug
