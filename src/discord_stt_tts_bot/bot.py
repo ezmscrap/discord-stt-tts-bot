@@ -722,6 +722,59 @@ async def resolve_message_channel(channel_id: int, guild_id: int) -> T.Optional[
     print("[STT] no messageable channel available")
     return None
 
+class _TrackedAudioData(discord.sinks.AudioData):
+    """discord.AudioData + byte_count tracking for reliable size checks."""
+
+    def __init__(self, file_obj: io.BytesIO):
+        super().__init__(file_obj)
+        self.byte_count = 0
+
+    def write(self, data):
+        self.byte_count += len(data)
+        super().write(data)
+
+
+class PatchedWaveSink(discord.sinks.Sink):
+    """discord.sinks.WaveSink 互換の録音シンク（WAVヘッダ書き込みの欠落を補完する）。"""
+
+    def __init__(self, *, filters=None):
+        super().__init__(filters=filters)
+        self.encoding = "wav"
+
+    @discord.sinks.Filters.container
+    def write(self, data, user):
+        if user not in self.audio_data:
+            self.audio_data[user] = _TrackedAudioData(io.BytesIO())
+        self.audio_data[user].write(data)
+
+    def cleanup(self):
+        self.finished = True
+        decoder = getattr(self.vc, "decoder", None)
+        channels = getattr(decoder, "CHANNELS", 2)
+        sample_rate = getattr(decoder, "SAMPLING_RATE", 48000)
+        sample_size = getattr(decoder, "SAMPLE_SIZE", channels * 2)
+        sample_width = max(1, sample_size // max(1, channels))
+
+        for audio in self.audio_data.values():
+            audio.cleanup()  # rewind + mark finished
+            pcm = audio.file.read()
+            wav_buf = io.BytesIO()
+            with wave.open(wav_buf, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(sample_width)
+                wf.setframerate(sample_rate)
+                if pcm:
+                    wf.writeframes(pcm)
+            wav_buf.seek(0)
+            # replace underlying file with WAV payload
+            try:
+                audio.file.close()
+            except Exception:
+                pass
+            audio.file = wav_buf
+            audio.byte_count = len(pcm)
+            audio.on_format(self.encoding)
+
 def wav_stats(src):
     """
     src: パス/bytes/BytesIO/file-like を受け取り、
@@ -1211,7 +1264,7 @@ async def rectest(ctx: commands.Context, seconds: int = 5):
         return await ctx.reply("録音秒数は 2〜30 秒の範囲で指定してください。 例: `!rectest 5`")
 
     # WaveSink でユーザー別にWAVを生成
-    sink = discord.sinks.WaveSink()
+    sink = PatchedWaveSink()
     done = asyncio.Event()
     captured = []
 
@@ -2568,7 +2621,7 @@ async def stt_worker(guild_id: int, channel_id: int):
                 # もし取り残しがあれば止める
                 await ensure_stopped(vc, "before start")
 
-                sink = discord.sinks.WaveSink()
+                sink = PatchedWaveSink()
                 done = asyncio.Event()
                 captured: list[tuple[int, object, bytes]] = []
 
@@ -2777,7 +2830,7 @@ async def record_once(guild: discord.Guild, seconds: int):
     if not vc or not vc.is_connected():
         return []
 
-    sink = discord.sinks.WaveSink()
+    sink = PatchedWaveSink()
     done = asyncio.Event()
     results: list[tuple[str, bytes]] = []
 
