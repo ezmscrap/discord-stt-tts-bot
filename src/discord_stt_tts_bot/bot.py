@@ -5,7 +5,7 @@ import shutil
 import discord
 import typing as T
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from discord import StageChannel, TextChannel, Thread
@@ -74,10 +74,12 @@ CCFO_DEFAULT_SPK = int(os.getenv("CCFOLIA_DEFAULT_SPEAKER", "2"))
 ccfo_queue: "asyncio.Queue[dict]" = asyncio.Queue()
 # ココフォリアの重複対策用に、直近のイベント履歴を保持する件数
 CCFO_EVENT_HISTORY_LIMIT: int = 300
+# ココフォリア連携で「重複」とみなす時間幅（秒）
+CCFO_EVENT_DUPLICATE_WINDOW_SEC: float = 10.0
 # ココフォリア連携の重複判定に用いるイベント履歴
 _ccfo_event_history: collections.deque["CCFoliaEventRecord"] = collections.deque()
-# 履歴に高速にアクセスするための集合
-_ccfo_event_history_index: set["CCFoliaEventRecord"] = set()
+# イベントごとの最終記録時刻を管理する辞書
+_ccfo_event_last_seen_map: dict[tuple[str, str, str, str], datetime] = {}
 # ログから履歴を読み込む処理が完了したかどうかのフラグ
 _ccfo_event_history_loaded: bool = False
 # イベント履歴を読み書きする際の同期用ロック
@@ -478,25 +480,51 @@ class CCFoliaEventRecord:
         text: 発言本文（CSV向けに正規化済み）。
         room: ココフォリアの部屋名。
         ts_client: クライアントが送信したタイムスタンプや識別子。
+        timestamp_utc: 取得時刻（UTC）。
     """
 
     speaker: str
     text: str
     room: str
     ts_client: str
+    timestamp_utc: datetime
+
+    @property
+    def identity(self) -> tuple[str, str, str, str]:
+        """イベントを一意に識別するためのキーを返す.
+
+        Returns:
+            発言内容を特定するためのタプル。
+        """
+        return (self.speaker, self.text, self.room, self.ts_client)
 
 
 def _append_ccfo_event_history(entry: CCFoliaEventRecord) -> None:
-    """重複判定用の履歴へイベントを追加する.
+    """重複判定用の履歴へイベントを追加し、古い情報を整理する.
 
     Args:
         entry: 追加対象のイベント。
     """
     _ccfo_event_history.append(entry)
-    _ccfo_event_history_index.add(entry)
+    _ccfo_event_last_seen_map[entry.identity] = entry.timestamp_utc
+
+    # 直近のイベントのみを保持する
     while len(_ccfo_event_history) > CCFO_EVENT_HISTORY_LIMIT:
-        removed_entry = _ccfo_event_history.popleft()  # 上限超過で除外した最古のイベント
-        _ccfo_event_history_index.discard(removed_entry)
+        removed_entry = _ccfo_event_history.popleft()
+        last_seen = _ccfo_event_last_seen_map.get(removed_entry.identity)
+        if last_seen is not None and last_seen <= removed_entry.timestamp_utc:
+            _ccfo_event_last_seen_map.pop(removed_entry.identity, None)
+
+    # 時間窓から外れたイベントを除去する
+    cutoff = entry.timestamp_utc - timedelta(seconds=CCFO_EVENT_DUPLICATE_WINDOW_SEC)
+    while _ccfo_event_history:
+        oldest_entry = _ccfo_event_history[0]
+        if oldest_entry.timestamp_utc >= cutoff:
+            break
+        removed_entry = _ccfo_event_history.popleft()
+        last_seen = _ccfo_event_last_seen_map.get(removed_entry.identity)
+        if last_seen is not None and last_seen <= removed_entry.timestamp_utc:
+            _ccfo_event_last_seen_map.pop(removed_entry.identity, None)
 
 
 def _ccfo_row_to_event_record(row: list[str]) -> CCFoliaEventRecord | None:
@@ -510,6 +538,15 @@ def _ccfo_row_to_event_record(row: list[str]) -> CCFoliaEventRecord | None:
     """
     if len(row) < 3:
         return None
+    timestamp_raw = (row[0] if len(row) > 0 else "").strip()
+    try:
+        timestamp_utc = datetime.fromisoformat(timestamp_raw)
+        if timestamp_utc.tzinfo is None:
+            timestamp_utc = timestamp_utc.replace(tzinfo=timezone.utc)
+        else:
+            timestamp_utc = timestamp_utc.astimezone(timezone.utc)
+    except Exception:
+        timestamp_utc = datetime.now(timezone.utc)
     speaker = (row[1] if len(row) > 1 else "").strip()
     text = _norm_text_for_csv(row[2] if len(row) > 2 else "")
     room = (row[3] if len(row) > 3 else "").strip()
@@ -519,6 +556,7 @@ def _ccfo_row_to_event_record(row: list[str]) -> CCFoliaEventRecord | None:
         text=text,
         room=room,
         ts_client=ts_client,
+        timestamp_utc=timestamp_utc,
     )
 
 
@@ -564,15 +602,16 @@ async def log_ccfolia_event(
         Trueなら新規イベントを記録したことを示し、Falseなら既存のイベントだったことを示す。
     """
     await _load_ccfo_event_history_from_log()
-    row: list[str]
     async with _ccfo_event_history_lock:
-        if event in _ccfo_event_history_index:
-            print(f"[CCFOLIA] duplicated event skipped: {event.speaker} / {event.text}")
-            return False
+        last_seen = _ccfo_event_last_seen_map.get(event.identity)
+        if last_seen is not None:
+            delta = event.timestamp_utc - last_seen
+            if delta.total_seconds() <= CCFO_EVENT_DUPLICATE_WINDOW_SEC:
+                print(f"[CCFOLIA] duplicated event skipped: {event.speaker} / {event.text}")
+                return False
         _append_ccfo_event_history(event)
-        ts_iso = datetime.now(timezone.utc).isoformat()  # ログ用のUTCタイムスタンプ
         row = [
-            ts_iso,
+            event.timestamp_utc.isoformat(),
             event.speaker,
             event.text,
             event.room,
@@ -4805,29 +4844,31 @@ async def ccfo_post_handler(request: web.Request):
     except Exception:
         return web.json_response({"ok": False, "error": "invalid_json"}, status=400, headers=_cors_headers(origin))
 
-    spk = (data.get("speaker") or "（未指定）").strip()
-    txt = (data.get("text") or "").strip()
-    room = (data.get("room") or "").strip()
-    ts_client = (data.get("ts_client") or "").strip()
-    normalized_text = _norm_text_for_csv(txt)  # Discord連携用に正規化したテキスト
-    print(['speaker',spk]) # for debug
-    print(['text',txt]) # for debug
-    print(['room',room]) # for debug
-    print(['ts_client',ts_client]) # for debug
-    if not normalized_text:
+    speaker_name = (data.get("speaker") or "（未指定）").strip()
+    raw_text = (data.get("text") or "").strip()
+    room_name = (data.get("room") or "").strip()
+    client_event_tag = (data.get("ts_client") or "").strip()
+    normalized_text_for_log = _norm_text_for_csv(raw_text)  # Discord連携用に正規化したテキスト
+    print(['speaker',speaker_name]) # for debug
+    print(['text',raw_text]) # for debug
+    print(['room',room_name]) # for debug
+    print(['ts_client',client_event_tag]) # for debug
+    if not normalized_text_for_log:
         return web.json_response({"ok": False, "error": "empty_text"}, status=400, headers=_cors_headers(origin))
 
+    event_timestamp = datetime.now(timezone.utc)
     event_record = CCFoliaEventRecord(
-        speaker=spk,
-        text=normalized_text,
-        room=room,
-        ts_client=ts_client,
+        speaker=speaker_name,
+        text=normalized_text_for_log,
+        room=room_name,
+        ts_client=client_event_tag,
+        timestamp_utc=event_timestamp,
     )
     is_new_event = await log_ccfolia_event(event=event_record)  # 重複を避けつつログへ記録
     if not is_new_event:
         return web.json_response({"ok": True}, headers=_cors_headers(origin))
 
-    await ccfo_queue.put({"speaker": spk, "text": txt, "room": room, "ts_client": ts_client})
+    await ccfo_queue.put({"speaker": speaker_name, "text": raw_text, "room": room_name, "ts_client": client_event_tag})
     print('check:ccfo_queue') # for debug
     print(ccfo_queue) # for debug
     print('end:ccfo_post_handler') # for debug
@@ -4907,34 +4948,34 @@ async def ccfo_pump_worker():
     text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
 
     while True:
-        ev = await ccfo_queue.get()
+        event_payload = await ccfo_queue.get()
         print('check:ccfo_queue') # for debug
         print(ccfo_queue) # for debug
-        sp = ev.get("speaker") or "（未指定）"
-        tx = ev.get("text") or ""
-        room = ev.get("room") or ""
-        ts_client = ev.get("ts_client") or ""
-        spk_id = _resolve_ccfo_speaker_id(sp)
+        speaker_name = event_payload.get("speaker") or "（未指定）"
+        text_for_dispatch = event_payload.get("text") or ""
+        room_name = event_payload.get("room") or ""
+        client_event_tag = event_payload.get("ts_client") or ""
+        resolved_speaker_id = _resolve_ccfo_speaker_id(speaker_name)
         
         if not text_ch:
             text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
 
-        print(['speaker',sp]) # for debug
-        print(['text',tx]) # for debug
-        print(['room',room]) # for debug
-        print(['ts_client',ts_client]) # for debug
-        print(['spk_id',spk_id]) # for debug
+        print(['speaker',speaker_name]) # for debug
+        print(['text',text_for_dispatch]) # for debug
+        print(['room',room_name]) # for debug
+        print(['ts_client',client_event_tag]) # for debug
+        print(['spk_id',resolved_speaker_id]) # for debug
         print(['text_ch',text_ch]) # for debug
 
         # 1) テキストミラー
         if isinstance(text_ch, discord.TextChannel):
-            print(['ccfolia event send to discord :text:',sp,',',tx]) # for debug
-            await _ccfo_send_text(text_ch, sp, tx, room, ts_client)
+            print(['ccfolia event send to discord :text:',speaker_name,',',text_for_dispatch]) # for debug
+            await _ccfo_send_text(text_ch, speaker_name, text_for_dispatch, room_name, client_event_tag)
 
         # 2) TTS
         if CCFO_TTS_MODE == "file":
             if isinstance(text_ch, discord.TextChannel):
-                await _ccfo_send_voicevox_file(text_ch, sp, tx, spk_id)
+                await _ccfo_send_voicevox_file(text_ch, speaker_name, text_for_dispatch, resolved_speaker_id)
         elif CCFO_TTS_MODE == "voice":
             ## 未指定は読み上げない。
             #if sp == "（未指定）":
@@ -4943,7 +4984,7 @@ async def ccfo_pump_worker():
             guilds = bot.guilds
             ok = False
             for g in guilds:
-                ok = await _ccfo_play_in_vc(g, f"{sp}：{tx}", spk_id)
+                ok = await _ccfo_play_in_vc(g, f"{speaker_name}：{text_for_dispatch}", resolved_speaker_id)
                 if ok:
                     break
             if not ok and isinstance(text_ch, discord.TextChannel):
