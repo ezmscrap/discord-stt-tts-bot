@@ -50,6 +50,10 @@ Discord のボイスチャンネルで **テキスト読み上げ (TTS)** と **
    ```bash
    python -m discord_stt_tts_bot
    ```
+6.5 **バックグラウンドで起動**
+   ```bash
+   nohup python -m discord_stt_tts_bot > bot.log 2>&1 &
+   ```
 
 VOICEVOX を利用する場合は `VOICEVOX_BASE_URL`（例: `http://127.0.0.1:50021`）や `VOICEVOX_DEFAULT_SPEAKER` を `.env` で設定してください。FFmpeg が未導入の場合は別途インストールし、`ffmpeg -version` で利用可能か確認してください。字幕カラーは16色パレットから自動割り当てされ、`!sttcolor` コマンドでユーザー単位に上書きできます。`!voicevoxstyles` で話者IDとスタイル名を確認し、`!voxdict` で VOICEVOX のユーザー辞書を管理できます。詳細なセットアップやコマンド一覧は `docs/usage.md` を参照してください。
 
