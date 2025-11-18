@@ -91,6 +91,8 @@ _ccfo_web_runner: web.AppRunner | None = None
 _ccfo_web_site: web.TCPSite | None = None
 # バックグラウンドタスク集合（キャンセル管理用）
 _ccfo_background_tasks: set[asyncio.Task[object]] = set()
+# デバッグログ出力制御用ロック
+_ccfo_debug_log_lock = threading.Lock()
 # === CCFOLIA BRIDGE END: env ===
 
 # === GUI 簡易設定 ===
@@ -161,10 +163,12 @@ def _resolve_data_dir(base_dir: Path, env_value: str | None, default_name: str) 
     return path
 
 LOG_DIR = _resolve_log_dir(PROJECT_ROOT, os.getenv("LOG_DIR"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 TTS_LOG_PATH = LOG_DIR / "tts_logs.csv"
 STT_LOG_PATH = LOG_DIR / "stt_logs.csv"
 STT_METRICS_PATH = LOG_DIR / "stt_metrics.csv"
 CCFO_LOG_PATH = LOG_DIR / "ccfolia_event_logs.csv"
+CCFO_DEBUG_LOG_PATH = LOG_DIR / "ccfolia_debug.log"
 _log_lock = asyncio.Lock()  # 複数タスクからの同時書き込みを保護
 print(f"[LOG] output directory: {LOG_DIR}")  # 起動時に出力先を表示
 DATA_DIR = _resolve_data_dir(PROJECT_ROOT, os.getenv("BOT_STATE_DIR"), "data")
@@ -565,6 +569,26 @@ def _ccfo_row_to_event_record(row: list[str]) -> CCFoliaEventRecord | None:
         ts_client=ts_client,
         timestamp_utc=timestamp_utc,
     )
+
+
+def _ccfo_debug_log(stage: str, payload: dict[str, T.Any] | None = None) -> None:
+    """CCFOLIA関連のデバッグ情報を標準出力とファイルへ残す。"""
+    ts = datetime.now(timezone.utc).isoformat()
+    record: dict[str, T.Any] = {"ts": ts, "stage": stage}
+    if payload:
+        record["payload"] = payload
+    try:
+        text_payload = json.dumps(payload, ensure_ascii=False) if payload else ""
+    except Exception:
+        text_payload = str(payload)
+    print(f"[CCFOLIA][DEBUG][{stage}] {text_payload}")
+    log_line = json.dumps(record, ensure_ascii=False)
+    try:
+        with _ccfo_debug_log_lock:
+            with CCFO_DEBUG_LOG_PATH.open("a", encoding="utf-8") as fp:
+                fp.write(log_line + "\n")
+    except Exception as exc:
+        print(f"[CCFOLIA][DEBUG] failed to write debug log: {exc!r}")
 
 
 async def _load_ccfo_event_history_from_log() -> None:
@@ -4849,7 +4873,6 @@ async def ccfo_options_handler(request: web.Request):
     return web.Response(status=200, headers=_cors_headers(origin))
 
 async def ccfo_post_handler(request: web.Request):
-    print('start:ccfo_post_handler') # for debug
     origin = request.headers.get("Origin")
     # IP/Token チェックはこれまで通り
     if not _ip_allowed(request.remote or ""):
@@ -4867,11 +4890,16 @@ async def ccfo_post_handler(request: web.Request):
     room_name = (data.get("room") or "").strip()
     client_event_tag = (data.get("ts_client") or "").strip()
     normalized_text_for_log = _norm_text_for_csv(raw_text)  # Discord連携用に正規化したテキスト
-    print(['speaker',speaker_name]) # for debug
-    print(['text',raw_text]) # for debug
-    print(['room',room_name]) # for debug
-    print(['ts_client',client_event_tag]) # for debug
+    post_debug_payload = {
+        "remote": request.remote,
+        "speaker": speaker_name,
+        "text": raw_text,
+        "room": room_name,
+        "ts_client": client_event_tag,
+    }
+    _ccfo_debug_log("post_received", post_debug_payload)
     if not normalized_text_for_log:
+        _ccfo_debug_log("post_rejected_empty_text", post_debug_payload)
         return web.json_response({"ok": False, "error": "empty_text"}, status=400, headers=_cors_headers(origin))
 
     event_timestamp = datetime.now(timezone.utc)
@@ -4883,13 +4911,16 @@ async def ccfo_post_handler(request: web.Request):
         timestamp_utc=event_timestamp,
     )
     is_new_event = await log_ccfolia_event(event=event_record)  # 重複を避けつつログへ記録
+    _ccfo_debug_log("event_logged", {**post_debug_payload, "is_new": is_new_event})
     if not is_new_event:
+        _ccfo_debug_log("event_skipped_duplicate", post_debug_payload)
         return web.json_response({"ok": True}, headers=_cors_headers(origin))
 
     await ccfo_queue.put({"speaker": speaker_name, "text": raw_text, "room": room_name, "ts_client": client_event_tag})
-    print('check:ccfo_queue') # for debug
-    print(ccfo_queue) # for debug
-    print('end:ccfo_post_handler') # for debug
+    _ccfo_debug_log(
+        "event_enqueued",
+        {**post_debug_payload, "queue_size": ccfo_queue.qsize()},
+    )
     return web.json_response({"ok": True}, headers=_cors_headers(origin))
 
 
@@ -4935,14 +4966,18 @@ async def _ccfo_send_text(ch: discord.TextChannel, speaker: str, text: str, room
     print(ch) # for debug
     await ch.send(content)
 
-async def _ccfo_send_voicevox_file(ch: discord.TextChannel, speaker: str, text: str, spk_id: int):
+async def _ccfo_generate_voicevox_wav(text: str, spk_id: int) -> bytes:
+    """VOICEVOX で合成した WAV データを返す。"""
+    return await _voicevox_synthesize(sanitize_for_tts(text), spk_id)
+
+async def _ccfo_send_voicevox_file(ch: discord.TextChannel, speaker: str, text: str, spk_id: int, wav: bytes | None = None):
     # 既存の VOICEVOX 同期関数を流用
     try:
-        wav = await _voicevox_synthesize(sanitize_for_tts(text), spk_id)
+        wav_bytes = wav if wav is not None else await _ccfo_generate_voicevox_wav(text, spk_id)
     except Exception as e:
         await ch.send(f"【TTS失敗:{speaker}】{e!r}")
         return
-    bio = io.BytesIO(wav); bio.seek(0)
+    bio = io.BytesIO(wav_bytes); bio.seek(0)
     await ch.send(file=discord.File(bio, filename=f"{speaker}.wav"))
 
 def _register_background_task(task: asyncio.Task[object]) -> None:
@@ -4999,18 +5034,18 @@ async def _disconnect_all_voice_clients(bot_instance: commands.Bot) -> None:
         await asyncio.gather(*disconnect_coroutines, return_exceptions=True)
 
 
-async def _ccfo_play_in_vc(guild: discord.Guild, text: str, spk_id: int):
+async def _ccfo_play_in_vc(guild: discord.Guild, text: str, spk_id: int, wav: bytes | None = None):
     vc = guild.voice_client
     if not vc or not vc.is_connected():
         return False
     # 直接 VOICEVOX で合成 → 一時WAV → VC 再生
     try:
-        wav = await _voicevox_synthesize(sanitize_for_tts(text), spk_id)
+        wav_bytes = wav if wav is not None else await _ccfo_generate_voicevox_wav(text, spk_id)
     except Exception as e:
         print("[CCFOLIA] VC TTS failed:", repr(e))
         return False
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        tmp = f.name; f.write(wav)
+        tmp = f.name; f.write(wav_bytes)
     try:
         await _play_vc_audio(vc, tmp)
         return True
@@ -5022,52 +5057,142 @@ async def ccfo_pump_worker():
     await bot.wait_until_ready()
     if not CCFO_MIRROR_CH_ID:
         print("[CCFOLIA] WARNING: CCFOLIA_MIRROR_CHANNEL_ID is not set; events will be dropped.")
-    print(['CCFO_MIRROR_CH_ID:',CCFO_MIRROR_CH_ID]) # for debug
+    _ccfo_debug_log("pump_worker_started", {"mirror_channel_id": CCFO_MIRROR_CH_ID})
     text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
 
     try:
         while True:
             event_payload = await ccfo_queue.get()
-            print('check:ccfo_queue') # for debug
-            print(ccfo_queue) # for debug
             speaker_name = event_payload.get("speaker") or "（未指定）"
             text_for_dispatch = event_payload.get("text") or ""
             room_name = event_payload.get("room") or ""
             client_event_tag = event_payload.get("ts_client") or ""
             resolved_speaker_id = _resolve_ccfo_speaker_id(speaker_name)
+            queue_size = max(ccfo_queue.qsize(), 0)
+            event_info = {
+                "speaker": speaker_name,
+                "text": text_for_dispatch,
+                "room": room_name,
+                "ts_client": client_event_tag,
+                "spk_id": resolved_speaker_id,
+                "queue_size": queue_size,
+            }
+            _ccfo_debug_log("event_dequeued", event_info)
 
             if not text_ch:
                 text_ch = bot.get_channel(CCFO_MIRROR_CH_ID) if CCFO_MIRROR_CH_ID else None
 
-            print(['speaker',speaker_name]) # for debug
-            print(['text',text_for_dispatch]) # for debug
-            print(['room',room_name]) # for debug
-            print(['ts_client',client_event_tag]) # for debug
-            print(['spk_id',resolved_speaker_id]) # for debug
-            print(['text_ch',text_ch]) # for debug
+            # 音声生成フェーズ
+            tts_bytes: bytes | None = None
+            tts_input_text = ""
+            if CCFO_TTS_MODE in ("file", "voice") and text_for_dispatch:
+                tts_input_text = (
+                    text_for_dispatch if CCFO_TTS_MODE == "file" else f"{speaker_name}：{text_for_dispatch}"
+                )
+                _ccfo_debug_log(
+                    "tts_generation_start",
+                    {
+                        "mode": CCFO_TTS_MODE,
+                        "spk_id": resolved_speaker_id,
+                        "text": tts_input_text,
+                    },
+                )
+                try:
+                    tts_bytes = await _ccfo_generate_voicevox_wav(tts_input_text, resolved_speaker_id)
+                    _ccfo_debug_log(
+                        "tts_generation_complete",
+                        {
+                            "mode": CCFO_TTS_MODE,
+                            "spk_id": resolved_speaker_id,
+                            "bytes": len(tts_bytes),
+                        },
+                    )
+                except Exception as exc:
+                    _ccfo_debug_log(
+                        "tts_generation_failed",
+                        {
+                            "mode": CCFO_TTS_MODE,
+                            "spk_id": resolved_speaker_id,
+                            "error": repr(exc),
+                        },
+                    )
+                    tts_bytes = None
+            else:
+                _ccfo_debug_log(
+                    "tts_generation_skipped",
+                    {"reason": "mode_off_or_empty_text", "mode": CCFO_TTS_MODE},
+                )
 
-            # 1) テキストミラー
+            # Discord 送信フェーズ
+            text_sent = False
+            attachment_sent = False
+            vc_played = False
+            _ccfo_debug_log(
+                "discord_dispatch_start",
+                {
+                    "channel_id": getattr(text_ch, "id", None),
+                    "tts_mode": CCFO_TTS_MODE,
+                },
+            )
+
             if isinstance(text_ch, discord.TextChannel):
-                print(['ccfolia event send to discord :text:',speaker_name,',',text_for_dispatch]) # for debug
-                await _ccfo_send_text(text_ch, speaker_name, text_for_dispatch, room_name, client_event_tag)
+                try:
+                    await _ccfo_send_text(text_ch, speaker_name, text_for_dispatch, room_name, client_event_tag)
+                    text_sent = True
+                except Exception as exc:
+                    _ccfo_debug_log(
+                        "discord_text_send_failed",
+                        {"channel_id": text_ch.id, "error": repr(exc)},
+                    )
 
-            # 2) TTS
-            if CCFO_TTS_MODE == "file":
-                if isinstance(text_ch, discord.TextChannel):
-                    await _ccfo_send_voicevox_file(text_ch, speaker_name, text_for_dispatch, resolved_speaker_id)
-            elif CCFO_TTS_MODE == "voice":
-                ## 未指定は読み上げない。
-                #if sp == "（未指定）":
-                #    break
-                # 最初のギルドに対して VC 再生を試みる（必要なら env で GUILD 固定も可）
+                if CCFO_TTS_MODE == "file" and tts_bytes:
+                    _ccfo_debug_log(
+                        "discord_file_send_start",
+                        {"channel_id": text_ch.id, "bytes": len(tts_bytes)},
+                    )
+                    try:
+                        await _ccfo_send_voicevox_file(text_ch, speaker_name, text_for_dispatch, resolved_speaker_id, wav=tts_bytes)
+                        attachment_sent = True
+                    except Exception as exc:
+                        _ccfo_debug_log(
+                            "discord_file_send_failed",
+                            {"channel_id": text_ch.id, "error": repr(exc)},
+                        )
+            else:
+                if CCFO_MIRROR_CH_ID:
+                    _ccfo_debug_log(
+                        "discord_channel_not_found",
+                        {"channel_id": CCFO_MIRROR_CH_ID},
+                    )
+
+            if CCFO_TTS_MODE == "voice" and text_for_dispatch:
+                speech_text = f"{speaker_name}：{text_for_dispatch}"
+                _ccfo_debug_log(
+                    "vc_playback_start",
+                    {"guilds": [g.id for g in bot.guilds], "text": speech_text},
+                )
                 guilds = bot.guilds
                 ok = False
                 for g in guilds:
-                    ok = await _ccfo_play_in_vc(g, f"{speaker_name}：{text_for_dispatch}", resolved_speaker_id)
+                    ok = await _ccfo_play_in_vc(g, speech_text, resolved_speaker_id, wav=tts_bytes)
                     if ok:
+                        vc_played = True
                         break
                 if not ok and isinstance(text_ch, discord.TextChannel):
                     await text_ch.send("（VC未接続のためTTSは再生できませんでした）")
+                _ccfo_debug_log(
+                    "vc_playback_complete",
+                    {"success": ok, "guild_ids": [g.id for g in guilds]},
+                )
+
+            _ccfo_debug_log(
+                "discord_dispatch_complete",
+                {
+                    "text_sent": text_sent,
+                    "attachment_sent": attachment_sent,
+                    "vc_played": vc_played,
+                },
+            )
     except asyncio.CancelledError:
         print("[CCFOLIA] pump worker cancelled")
         raise
