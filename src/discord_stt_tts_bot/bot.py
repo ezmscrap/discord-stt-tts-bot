@@ -17,6 +17,8 @@ from openai import OpenAI
 from pathlib import Path
 import requests
 
+from discord.voice_client import VoiceClient as _PycordVoiceClient
+
 try:
     import webrtcvad
 except ImportError:  # pragma: no cover - optional dependency guard
@@ -62,6 +64,17 @@ try:
         _STT_COST_OVERRIDES = {}
 except Exception:
     _STT_COST_OVERRIDES = {}
+# Force py-cord to fall back to legacy XSalsa20-based modes. Discord started
+# advertising AEAD/XChaCha modes first, but py-cord fails to decrypt them in
+# some environments, resulting in `CryptoError: Decryption failed`. By limiting
+# supported_modes to XSalsa variants we ensure the voice gateway negotiates a
+# mode we can handle reliably.
+_PycordVoiceClient.supported_modes = (
+    "xsalsa20_poly1305_lite",
+    "xsalsa20_poly1305_suffix",
+    "xsalsa20_poly1305",
+)
+
 # === CCFOLIA BRIDGE START: env ===
 CCFO_HOST = os.getenv("CCFOLIA_BRIDGE_HOST", "127.0.0.1")
 CCFO_PORT = int(os.getenv("CCFOLIA_BRIDGE_PORT", "8800"))
